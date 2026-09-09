@@ -1,0 +1,26 @@
+{
+  "name": "motionlab-gait-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "assets": "node scripts/copy-assets.mjs",
+    "dev": "vite --host 0.0.0.0",
+    "build": "npm run assets && tsc -b && vite build",
+    "preview": "vite preview --host 0.0.0.0",
+    "test": "vitest run",
+    "check": "tsc -b --pretty false"
+  },
+  "dependencies": {
+    "@mediapipe/tasks-vision": "1.0.1",
+    "workbox-window": "^7.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0",
+    "vite": "^7.0.0",
+    "vite-plugin-pwa": "^1.0.0",
+    "vitest": "^3.2.0"
+  },
+  "packageManager": "pnpm@11.19.0"
+}
