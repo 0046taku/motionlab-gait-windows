@@ -28,12 +28,14 @@ jobs:
           version: 11.19.0
       - uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: 24
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
       - run: pnpm test
       - run: pnpm build
+        env:
+          VITE_BASE_PATH: /motionlab-gait-windows/
       - uses: actions/upload-pages-artifact@v4
         with:
           path: web/dist

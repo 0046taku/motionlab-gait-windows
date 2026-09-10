@@ -1,8 +1,10 @@
 import { defineConfig } from "vite";
 import { VitePWA } from "vite-plugin-pwa";
 
+const base = process.env.VITE_BASE_PATH || "/";
+
 export default defineConfig({
-  base: "./",
+  base,
   plugins: [
     VitePWA({
       registerType: "prompt",
