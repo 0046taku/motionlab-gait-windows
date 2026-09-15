@@ -1,4 +1,4 @@
-import type { PoseFrame } from "../domain/models";
+import type { PoseFrame, VideoAnalysisMetadata } from "../domain/models";
 import { MediaPipePoseProvider } from "../pose/MediaPipePoseProvider";
 
 export interface AnalysisProgress {
@@ -17,13 +17,15 @@ export class VideoPoseAnalyzer {
   async analyze(
     blob: Blob,
     onProgress: (progress: AnalysisProgress) => void,
-    sampleFps = 30
-  ): Promise<{ frames: PoseFrame[]; durationMs: number }> {
+    fallbackSampleFps = 30
+  ): Promise<{ frames: PoseFrame[]; durationMs: number; metadata: VideoAnalysisMetadata }> {
     this.cancelled = false;
     const video = document.createElement("video");
     video.muted = true;
     video.playsInline = true;
     video.preload = "auto";
+    video.style.cssText = "position:fixed;width:1px;height:1px;opacity:0;pointer-events:none;left:-10px;top:-10px";
+    document.body.append(video);
     const objectUrl = URL.createObjectURL(blob);
     video.src = objectUrl;
     const provider = new MediaPipePoseProvider();
@@ -42,8 +44,17 @@ export class VideoPoseAnalyzer {
       onProgress({ completed: 0, total: 1, message: "Poseモデルを準備しています…" });
       await provider.initialize();
 
-      const frameInterval = 1 / sampleFps;
-      const total = Math.max(1, Math.floor(video.duration * sampleFps));
+      onProgress({ completed: 0, total: 1, message: "動画の実timestampを確認しています…" });
+      const presentationTimestamps = await collectPresentationTimestamps(
+        video, () => this.cancelled
+      ).catch(() => null);
+      if (this.cancelled) throw new Error("解析を中止しました。");
+      const timestamps = presentationTimestamps && presentationTimestamps.length >= 10
+        ? presentationTimestamps
+        : fixedTimestamps(video.duration, fallbackSampleFps);
+      const timestampSource: VideoAnalysisMetadata["timestampSource"] = presentationTimestamps && presentationTimestamps.length >= 10
+        ? "presentation_timestamps" : "fixed_30fps_fallback";
+      const total = timestamps.length;
       const canvas = document.createElement("canvas");
       const scale = Math.min(1, 640 / Math.max(video.videoWidth, video.videoHeight));
       canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
@@ -52,14 +63,16 @@ export class VideoPoseAnalyzer {
       if (!context) throw new Error("動画フレームを読み取れませんでした。");
 
       const frames: PoseFrame[] = [];
-      for (let frameIndex = 0; frameIndex < total; frameIndex += 1) {
+      const brightnessValues: number[] = [];
+      for (let frameIndex = 0; frameIndex < timestamps.length; frameIndex += 1) {
         if (this.cancelled) throw new Error("解析を中止しました。");
-        const seconds = Math.min(video.duration - 0.001, frameIndex * frameInterval);
+        const seconds = Math.min(video.duration - 0.001, timestamps[frameIndex]!);
         await seek(video, Math.max(0, seconds));
         context.drawImage(video, 0, 0, canvas.width, canvas.height);
         // ImageData avoids depending on transferable ImageBitmap support,
         // which varies between iOS/iPadOS Safari releases.
         const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+        brightnessValues.push(estimateBrightness(imageData));
         const timestampMs = Math.round(seconds * 1000);
         const frame = await provider.detect(imageData, frameIndex, timestampMs);
         frames.push(frame);
@@ -70,14 +83,99 @@ export class VideoPoseAnalyzer {
         });
         await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
       }
-      return { frames, durationMs: Math.round(video.duration * 1000) };
+      const intervals = timestamps.slice(1).map((value, index) => value - timestamps[index]!)
+        .filter((value) => value > 0 && value <= 1);
+      const estimatedFps = intervals.length ? 1 / median(intervals) : fallbackSampleFps;
+      return {
+        frames,
+        durationMs: Math.round(video.duration * 1000),
+        metadata: {
+          frameWidth: canvas.width,
+          frameHeight: canvas.height,
+          estimatedFps,
+          timestampSource,
+          averageBrightness: average(brightnessValues),
+          lowBrightnessRate: brightnessValues.length
+            ? brightnessValues.filter((value) => value < 45).length / brightnessValues.length : 1,
+          analyzedFrameCount: frames.length
+        }
+      };
     } finally {
       URL.revokeObjectURL(objectUrl);
       video.removeAttribute("src");
       video.load();
+      video.remove();
       await provider.close().catch(() => undefined);
     }
   }
+}
+
+function fixedTimestamps(duration: number, fps: number): number[] {
+  const total = Math.max(1, Math.floor(duration * fps));
+  return Array.from({ length: total }, (_, index) => index / fps);
+}
+
+function collectPresentationTimestamps(
+  video: HTMLVideoElement,
+  isCancelled: () => boolean
+): Promise<number[] | null> {
+  if (typeof video.requestVideoFrameCallback !== "function") return Promise.resolve(null);
+  return new Promise((resolve) => {
+    const timestamps: number[] = [];
+    let settled = false;
+    let handle: number | null = null;
+    const finish = (value: number[] | null) => {
+      if (settled) return;
+      settled = true;
+      if (handle !== null && typeof video.cancelVideoFrameCallback === "function") {
+        video.cancelVideoFrameCallback(handle);
+      }
+      window.clearTimeout(timeout);
+      video.removeEventListener("ended", ended);
+      video.pause();
+      resolve(value);
+    };
+    const callback: VideoFrameRequestCallback = (_now, metadata) => {
+      if (isCancelled()) { finish(timestamps); return; }
+      const mediaTime = metadata.mediaTime;
+      if (Number.isFinite(mediaTime) && (timestamps.length === 0 || mediaTime - timestamps.at(-1)! > 0.0001)) {
+        timestamps.push(mediaTime);
+      }
+      if (!video.ended) handle = video.requestVideoFrameCallback(callback);
+    };
+    const ended = () => finish(timestamps);
+    const timeout = window.setTimeout(
+      () => finish(null),
+      Math.min(150_000, Math.max(20_000, video.duration * 2_000 + 10_000))
+    );
+    video.addEventListener("ended", ended, { once: true });
+    video.currentTime = 0;
+    handle = video.requestVideoFrameCallback(callback);
+    void video.play().catch(() => finish(null));
+  });
+}
+
+function estimateBrightness(image: ImageData): number {
+  const data = image.data;
+  let total = 0;
+  let samples = 0;
+  const stride = 4 * 64;
+  for (let index = 0; index < data.length; index += stride) {
+    total += 0.2126 * data[index]! + 0.7152 * data[index + 1]! + 0.0722 * data[index + 2]!;
+    samples += 1;
+  }
+  return samples ? total / samples : 0;
+}
+
+function average(values: readonly number[]): number {
+  return values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
+}
+
+function median(values: readonly number[]): number {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[middle]! : (sorted[middle - 1]! + sorted[middle]!) / 2;
 }
 
 function waitForMetadata(video: HTMLVideoElement): Promise<void> {

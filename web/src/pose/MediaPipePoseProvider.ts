@@ -66,7 +66,13 @@ export class MediaPipePoseProvider {
       [pixels]
     );
     if (response.type !== "result") throw new Error("Pose結果を取得できませんでした。");
-    return response.frame;
+    return {
+      ...response.frame,
+      // drawImage() has already applied the video's display rotation. Keeping
+      // these dimensions lets biomechanics use pixel geometry, never UI layout.
+      frameWidth: imageData.width,
+      frameHeight: imageData.height
+    };
   }
 
   async close(): Promise<void> {

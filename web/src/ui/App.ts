@@ -1,10 +1,11 @@
-import type { Patient, VideoStudy } from "../domain/models";
+import type { CaptureConditions, Patient, VideoStudy } from "../domain/models";
 import { analyzeGait } from "../analysis/gaitAnalysis";
 import type { GaitAnalysisResult } from "../analysis/types";
 import { nearestPoseFrame, SkeletonRenderer } from "../overlay/SkeletonRenderer";
 import { MotionLabDatabase } from "../storage/database";
 import { VideoPoseAnalyzer } from "../video/VideoPoseAnalyzer";
 import { AnalysisResultsView } from "./AnalysisResultsView";
+import { CaptureGuide } from "./CaptureGuide";
 
 export class App {
   private readonly database = new MotionLabDatabase();
@@ -18,11 +19,13 @@ export class App {
   private overlayResizeObserver: ResizeObserver | null = null;
   private viewerTab: "video" | "analysis" = "video";
   private readonly gaitAnalysisCache = new Map<string, GaitAnalysisResult>();
+  private captureGuide: CaptureGuide | null = null;
 
   constructor(private readonly root: HTMLElement) {}
 
   async start(): Promise<void> {
     this.renderShell();
+    this.captureGuide = new CaptureGuide(this.root);
     this.bindGlobalActions();
     try {
       this.patients = await this.database.listPatients();
@@ -69,6 +72,9 @@ export class App {
           <div class="field"><label for="patient-note">メモ（任意）</label>
             <textarea id="patient-note" name="note" maxlength="500" rows="3"></textarea>
           </div>
+          <div class="field"><label for="affected-side">麻痺側（任意）</label>
+            <select id="affected-side" name="affectedSide"><option value="none">未設定</option><option value="left">左</option><option value="right">右</option></select>
+          </div>
           <p id="patient-form-error" class="notice error" hidden></p>
           <div class="dialog-actions">
             <button id="cancel-patient" class="button ghost" type="button">キャンセル</button>
@@ -107,6 +113,7 @@ export class App {
     const patientCode = String(data.get("patientCode") ?? "").trim();
     const displayName = String(data.get("displayName") ?? "").trim();
     const note = String(data.get("note") ?? "").trim();
+    const affectedSide = String(data.get("affectedSide") ?? "none") as Patient["affectedSide"];
     const errorElement = this.requireElement("patient-form-error");
     if (!patientCode) return;
     if (this.patients.some((item) => item.patientCode.toLocaleLowerCase() === patientCode.toLocaleLowerCase())) {
@@ -115,7 +122,8 @@ export class App {
       return;
     }
     const patient: Patient = {
-      id: crypto.randomUUID(), patientCode, displayName, note, createdAt: new Date().toISOString()
+      id: crypto.randomUUID(), patientCode, displayName, note, affectedSide,
+      createdAt: new Date().toISOString()
     };
     try {
       await this.database.savePatient(patient);
@@ -184,12 +192,12 @@ export class App {
     main.innerHTML = `
       <div class="patient-heading"><div><h2 id="patient-heading"></h2><p id="patient-note"></p></div>
         <div class="video-actions">
-          <label class="button file-button">カメラで撮影
-            <input id="video-capture" type="file" accept="video/*" capture="environment" />
-          </label>
+          <button id="capture-video" class="button" type="button">カメラで撮影</button>
+          <input id="video-capture" class="sr-only" type="file" accept="video/*" capture="environment" />
           <label class="button secondary file-button">動画を選択
             <input id="video-input" type="file" accept="video/mp4,video/quicktime,video/x-m4v,video/*" />
           </label>
+          <button id="capture-manual" class="button ghost" type="button">撮影方法</button>
         </div>
       </div>
       <div class="workflow">
@@ -200,13 +208,24 @@ export class App {
     this.requireElement("patient-heading").textContent = patient.displayName
       ? `${patient.patientCode}　${patient.displayName}` : patient.patientCode;
     this.requireElement("patient-note").textContent = patient.note || "患者メモなし";
-    for (const id of ["video-capture", "video-input"]) {
-      this.requireElement<HTMLInputElement>(id).addEventListener("change", (event) => {
-        const input = event.currentTarget as HTMLInputElement;
-        const file = input.files?.[0];
-        if (file) void this.importVideo(file).finally(() => { input.value = ""; });
+    const captureInput = this.requireElement<HTMLInputElement>("video-capture");
+    let captureConditions = defaultCaptureConditions();
+    this.requireElement("capture-video").addEventListener("click", () => {
+      this.captureGuide?.openForCapture(patient, (conditions) => {
+        captureConditions = conditions;
+        captureInput.click();
       });
-    }
+    });
+    captureInput.addEventListener("change", () => {
+      const file = captureInput.files?.[0];
+      if (file) void this.importVideo(file, captureConditions).finally(() => { captureInput.value = ""; });
+    });
+    const videoInput = this.requireElement<HTMLInputElement>("video-input");
+    videoInput.addEventListener("change", () => {
+      const file = videoInput.files?.[0];
+      if (file) void this.importVideo(file, defaultCaptureConditions()).finally(() => { videoInput.value = ""; });
+    });
+    this.requireElement("capture-manual").addEventListener("click", () => this.captureGuide?.openManual());
     this.renderStudyList();
     this.renderViewer();
   }
@@ -300,12 +319,20 @@ export class App {
 
   private renderAnalysisResults(study: VideoStudy): void {
     const panel = this.requireElement("analysis-view-panel");
+    const result = this.getGaitAnalysis(study);
+    new AnalysisResultsView(panel, result).render();
+  }
+
+  private getGaitAnalysis(study: VideoStudy): GaitAnalysisResult {
     let result = this.gaitAnalysisCache.get(study.id);
     if (!result) {
-      result = analyzeGait(study.poseFrames);
+      result = analyzeGait(study.poseFrames, {
+        videoMetadata: study.videoMetadata,
+        cameraSide: study.captureConditions?.cameraSide
+      });
       this.gaitAnalysisCache.set(study.id, result);
     }
-    new AnalysisResultsView(panel, result).render();
+    return result;
   }
 
   private renderResultSummary(study: VideoStudy): void {
@@ -322,15 +349,23 @@ export class App {
     }
     const detected = study.poseFrames.filter((frame) => frame.landmarks.length === 33).length;
     const detectionRate = study.poseFrames.length ? (100 * detected / study.poseFrames.length).toFixed(1) : "0.0";
-    container.innerHTML = `<div class="result-grid">
+    const result = this.getGaitAnalysis(study);
+    const quality = result.acquisitionQuality;
+    const qualityLabel = { high: "高", caution: "注意", retake: "撮り直し推奨" }[quality.status];
+    const metadata = study.videoMetadata;
+    container.innerHTML = `<div class="capture-quality ${quality.status}">
+      <div><span>撮影品質</span><strong>${qualityLabel}</strong></div>
+      ${quality.reasons.length ? `<ul>${quality.reasons.map((reason) => `<li>${reason}</li>`).join("")}</ul>` : `<p>側方性・足部追跡・歩行周期を確認できました。</p>`}
+    </div>
+    <div class="result-grid">
       <div class="metric"><span>Poseフレーム</span><strong>${study.poseFrames.length}</strong></div>
       <div class="metric"><span>33点検出率</span><strong>${detectionRate}%</strong></div>
-      <div class="metric"><span>動画時間</span><strong>${(study.durationMs / 1000).toFixed(1)}秒</strong></div>
+      <div class="metric"><span>解析fps</span><strong>${metadata ? metadata.estimatedFps.toFixed(1) : "—"}</strong></div>
     </div>
-    <p class="notice">再生・停止・シークにSkeletonが追従します。関節角度は「解析結果」タブで確認できます。</p>`;
+    <p class="notice">${quality.status === "retake" ? "正確な解析が難しいため、撮り直しをおすすめします。" : "再生・停止・シークにSkeletonが追従します。関節角度は「解析結果」タブで確認できます。"}</p>`;
   }
 
-  private async importVideo(file: File): Promise<void> {
+  private async importVideo(file: File, captureConditions: CaptureConditions): Promise<void> {
     if (!this.selectedPatientId) return;
     if (!file.type.startsWith("video/") && !/\.(mov|mp4|m4v|webm)$/i.test(file.name)) {
       this.showGlobalError(new Error("動画ファイルを選択してください。"));
@@ -339,7 +374,8 @@ export class App {
     const study: VideoStudy = {
       id: crypto.randomUUID(), patientId: this.selectedPatientId, originalName: file.name,
       createdAt: new Date().toISOString(), durationMs: 0, status: "pending", error: "",
-      video: file, poseFrames: [], schema: "motionlab.pose.v1", analysisVersion: "motionlab-gait-web/0.1.0"
+      video: file, poseFrames: [], schema: "motionlab.pose.v1",
+      analysisVersion: "motionlab-gait-web/0.3.0", captureConditions
     };
     try {
       await this.database.saveVideo(study);
@@ -369,6 +405,8 @@ export class App {
       study.status = "ready";
       study.durationMs = result.durationMs;
       study.poseFrames = result.frames;
+      study.videoMetadata = result.metadata;
+      study.analysisVersion = "motionlab-gait-web/0.3.0";
       study.error = "";
       this.gaitAnalysisCache.delete(study.id);
     } catch (error) {
@@ -444,4 +482,8 @@ export class App {
 
 function statusLabel(status: VideoStudy["status"]): string {
   return { pending: "未解析", analyzing: "解析中", ready: "Pose完了", failed: "エラー" }[status];
+}
+
+function defaultCaptureConditions(): CaptureConditions {
+  return { gaitMode: "unspecified", orthosis: "unspecified", walkingAid: "unspecified", cameraSide: "unspecified" };
 }

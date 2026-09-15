@@ -14,6 +14,7 @@ export interface Patient {
   displayName: string;
   note: string;
   createdAt: string;
+  affectedSide?: "left" | "right" | "none";
 }
 
 export interface PoseLandmark {
@@ -33,6 +34,26 @@ export interface PoseFrame {
   frameIndex: number;
   timestampMs: number;
   landmarks: PoseLandmark[];
+  /** Dimensions of the rotation-corrected frame used for Pose inference. */
+  frameWidth?: number;
+  frameHeight?: number;
+}
+
+export interface CaptureConditions {
+  gaitMode: "comfortable" | "maximum" | "unspecified";
+  orthosis: "none" | "used" | "unspecified";
+  walkingAid: "none" | "used" | "unspecified";
+  cameraSide: "left" | "right" | "unspecified";
+}
+
+export interface VideoAnalysisMetadata {
+  frameWidth: number;
+  frameHeight: number;
+  estimatedFps: number;
+  timestampSource: "presentation_timestamps" | "fixed_30fps_fallback";
+  averageBrightness: number;
+  lowBrightnessRate: number;
+  analyzedFrameCount: number;
 }
 
 export type VideoStatus = "pending" | "analyzing" | "ready" | "failed";
@@ -48,7 +69,9 @@ export interface VideoStudy {
   video: Blob;
   poseFrames: PoseFrame[];
   schema: "motionlab.pose.v1";
-  analysisVersion: "motionlab-gait-web/0.1.0";
+  analysisVersion: "motionlab-gait-web/0.1.0" | "motionlab-gait-web/0.2.0" | "motionlab-gait-web/0.3.0";
+  captureConditions?: CaptureConditions;
+  videoMetadata?: VideoAnalysisMetadata;
 }
 
 export interface StorageEstimate {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { POSE_LANDMARK_NAMES, type PoseFrame, type PoseLandmark } from "../domain/models";
-import { analyzeGait, calculateJointAngles } from "./gaitAnalysis";
+import { analyzeGait, calculateJointAngles, representativeWaveform } from "./gaitAnalysis";
 import { processLandmarks } from "./landmarkProcessor";
 import type { GaitCycle } from "./types";
 
@@ -20,7 +20,7 @@ function walkingFrames(seconds = 8, fps = 30): PoseFrame[] {
       else if (name.includes("foot_index")) { x += swing + 0.03; y = 0.91; }
       return { index, name, x, y, z, visibility: 0.95, presence: null, worldX: null, worldY: null, worldZ: null };
     });
-    return { frameIndex, timestampMs: Math.round(time * 1000), landmarks };
+    return { frameIndex, timestampMs: Math.round(time * 1000), landmarks, frameWidth: 640, frameHeight: 640 };
   });
 }
 
@@ -41,6 +41,7 @@ describe("Windows gait-analysis parity", () => {
     expect(new Set(result.angles.map((point) => point.side))).toEqual(new Set(["left", "right"]));
     expect(result.cycles.every((cycle) => Math.abs(cycle.endMs - cycle.startMs - 1000) <= 40)).toBe(true);
     expect(result.processing.presenceFallback).toBe(true);
+    expect(result.acquisitionQuality.status).toBe("high");
     const windowsRanges = {
       hip_flexion: [-14.096, 14.096, 28.192],
       knee_flexion: [0, 2.455, 2.455],
@@ -68,9 +69,65 @@ describe("Windows gait-analysis parity", () => {
       landmarks[index] = { ...landmarks[index]!, x: coordinates[0], y: coordinates[1] };
     }
     const cycles: GaitCycle[] = [{ side: "left", startMs: 0, endMs: 1000, toeOffMs: 600, confidence: 0.9 }];
-    const ankle = calculateJointAngles([{ timestampMs: 500, landmarks }], cycles, "right")
+    const ankle = calculateJointAngles([{ timestampMs: 500, landmarks, frameWidth: 640, frameHeight: 640 }], cycles, "right")
       .find((point) => point.side === "left" && point.joint === "ankle_dorsiflexion");
     expect(ankle?.angleDegrees).toBeCloseTo(0, 3);
+  });
+
+  it("uses rotation-corrected pixel geometry instead of distorted normalized coordinates", () => {
+    const landmarks = POSE_LANDMARK_NAMES.map<PoseLandmark>((name, index) => ({
+      index, name, x: 0.5, y: 0.2, z: 0, visibility: 0.95, presence: 0.95,
+      worldX: null, worldY: null, worldZ: null
+    }));
+    const coordinates = new Map<number, [number, number]>([
+      [11, [0.5, 0.2]], [23, [0.5, 0.4]], [25, [0.6125, 0.6]],
+      [27, [0.65, 0.8]], [29, [0.65, 0.85]], [31, [0.75, 0.85]]
+    ]);
+    for (const [index, [x, y]] of coordinates) landmarks[index] = { ...landmarks[index]!, x, y };
+    const cycles: GaitCycle[] = [{ side: "left", startMs: 0, endMs: 1000, toeOffMs: 600, confidence: 0.9 }];
+    const hip = calculateJointAngles([
+      { timestampMs: 500, landmarks, frameWidth: 640, frameHeight: 360 }
+    ], cycles, "right").find((point) => point.side === "left" && point.joint === "hip_flexion");
+    expect(hip?.angleDegrees).toBeCloseTo(45, 3);
+  });
+
+  it("keeps hip and knee available when only the foot landmarks are missing", () => {
+    const frame = walkingFrames(1, 1)[0]!;
+    const landmarks = frame.landmarks.filter((landmark) => ![29, 31].includes(landmark.index));
+    const cycles: GaitCycle[] = [{ side: "left", startMs: 0, endMs: 1000, toeOffMs: 600, confidence: 0.9 }];
+    const joints = calculateJointAngles([
+      { ...frame, timestampMs: 500, landmarks }
+    ], cycles, "right").filter((point) => point.side === "left").map((point) => point.joint);
+    expect(joints).toContain("hip_flexion");
+    expect(joints).toContain("knee_flexion");
+    expect(joints).not.toContain("ankle_dorsiflexion");
+  });
+
+  it("provides hidden 4/6/8 Hz validation without changing the clinical result", () => {
+    const result = analyzeGait(walkingFrames(5), { validationMode: true });
+    expect(new Set(result.filterValidation.map((item) => item.cutoffHz))).toEqual(new Set([4, 6, 8]));
+    expect(result.versions.angleDefinitionVersion).toBe("sagittal-pixel-v2");
+    expect(result.versions.eventDetectorVersion).toBe("multisignal-v2");
+    expect(representativeWaveform(result.angles, "knee_flexion", "left", "median").length).toBeGreaterThan(20);
+    expect(representativeWaveform(result.angles, "knee_flexion", "left", "mean").length).toBeGreaterThan(20);
+  });
+
+  it("is deterministic and never overwrites raw Pose input", () => {
+    const frames = walkingFrames(5);
+    const before = structuredClone(frames);
+    expect(analyzeGait(frames)).toEqual(analyzeGait(frames));
+    expect(frames).toEqual(before);
+  });
+
+  it("withholds the clinical graph when foot tracking is not usable", () => {
+    const frames = walkingFrames(5).map((frame) => ({
+      ...frame,
+      landmarks: frame.landmarks.map((landmark) => [27, 28, 29, 30, 31, 32].includes(landmark.index)
+        ? { ...landmark, visibility: 0.1, presence: 0.1 } : landmark)
+    }));
+    const result = analyzeGait(frames, { cameraSide: "left" });
+    expect(result.acquisitionQuality.status).toBe("retake");
+    expect(result.acquisitionQuality.reasons.some((reason) => reason.includes("踵・足先"))).toBe(true);
   });
 
   it("removes a one-frame landmark excursion before zero-phase smoothing", () => {

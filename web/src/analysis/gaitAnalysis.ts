@@ -1,10 +1,25 @@
-import type { PoseFrame, PoseLandmark } from "../domain/models";
+import type { PoseFrame, PoseLandmark, VideoAnalysisMetadata } from "../domain/models";
+import { assessAcquisitionQuality } from "./acquisitionQuality";
 import { effectivePresence, processLandmarks } from "./landmarkProcessor";
 import { clamp, mean, median, round, standardDeviation } from "./statistics";
 import type {
-  AnglePoint, GaitAnalysisResult, GaitCycle, GaitEvent, Joint,
+  AnalysisVersions, AnglePoint, FilterCandidateValidation, GaitAnalysisResult, GaitCycle, GaitEvent, Joint,
   JointQualityReport, ProcessedPoseFrame, Side, ViewpointReport
 } from "./types";
+
+const VERSIONS: AnalysisVersions = {
+  analysisVersion: "motionlab-gait-web/0.3.0",
+  poseModelVersion: "@mediapipe/tasks-vision@1.0.1/pose_landmarker_full",
+  filterVersion: "butterworth4-zero-phase-v1",
+  angleDefinitionVersion: "sagittal-pixel-v2",
+  eventDetectorVersion: "multisignal-v2"
+};
+
+export interface GaitAnalysisOptions {
+  videoMetadata?: VideoAnalysisMetadata;
+  cameraSide?: "left" | "right" | "unspecified";
+  validationMode?: boolean;
+}
 
 const SIDES: readonly Side[] = ["left", "right"];
 const JOINTS: readonly Joint[] = ["hip_flexion", "knee_flexion", "ankle_dorsiflexion"];
@@ -18,31 +33,46 @@ const JOINT_LANDMARKS: Record<Joint, Record<Side, readonly number[]>> = {
   ankle_dorsiflexion: { left: [25, 27, 29, 31], right: [26, 28, 30, 32] }
 };
 
-export function analyzeGait(frames: readonly PoseFrame[]): GaitAnalysisResult {
-  const processing = processLandmarks(frames);
+export function analyzeGait(frames: readonly PoseFrame[], options: GaitAnalysisOptions = {}): GaitAnalysisResult {
+  const geometryFrames = frames.map((frame) => withFrameGeometry(frame, options.videoMetadata));
+  const primarySide = options.cameraSide === "left" || options.cameraSide === "right" ? options.cameraSide : null;
+  const processing = processLandmarks(geometryFrames);
   const viewpoint = assessViewpoint(processing.frames, processing.fps);
   const warnings = [...viewpoint.warnings];
   if (!viewpoint.analysisSupported) {
+    const acquisitionQuality = assessAcquisitionQuality(
+      geometryFrames, options.videoMetadata, viewpoint, [], primarySide
+    );
     return {
-      analysisVersion: "motionlab-gait-web/0.2.0", fps: processing.fps,
+      analysisVersion: "motionlab-gait-web/0.3.0", versions: VERSIONS,
+      fps: processing.fps, videoMetadata: options.videoMetadata, primarySide, acquisitionQuality,
       direction: "unknown", directionConfidence: 0, viewpoint,
       processing: processing.report, events: [], cycles: [], angles: [], rawAngles: [],
-      jointQuality: JOINTS.map((joint) => emptyQuality(joint)), warnings
+      jointQuality: JOINTS.map((joint) => emptyQuality(joint)), filterValidation: [], warnings
     };
   }
   const filteredFrames = selectAnalysisFrames(processing.frames, viewpoint);
-  const rawFrames = selectAnalysisFrames(frames, viewpoint);
+  const rawFrames = selectAnalysisFrames(geometryFrames, viewpoint);
   const detected = detectEvents(filteredFrames, processing.fps);
   warnings.push(...detected.warnings);
   const filteredAngles = calculateJointAngles(filteredFrames, detected.cycles, detected.direction);
   const rawAngles = calculateJointAngles(rawFrames, detected.cycles, detected.direction);
   const assessments = JOINTS.map((joint) => assessJoint(
-    joint, rawFrames, filteredFrames, filteredAngles, detected.cycles, detected.direction
+    joint, rawFrames, filteredFrames, filteredAngles, detected.cycles, detected.direction, primarySide
   ));
   const validCycles = new Map(assessments.map((item) => [item.report.joint, item.validCycleKeys]));
+  const acquisitionQuality = assessAcquisitionQuality(
+    rawFrames, options.videoMetadata, viewpoint, detected.cycles, primarySide
+  );
+  const filterValidation = options.validationMode
+    ? validateFilterCandidates(geometryFrames, viewpoint, detected.cycles, detected.direction, filteredAngles)
+    : [];
   return {
-    analysisVersion: "motionlab-gait-web/0.2.0",
+    analysisVersion: "motionlab-gait-web/0.3.0", versions: VERSIONS,
     fps: processing.fps,
+    videoMetadata: options.videoMetadata,
+    primarySide,
+    acquisitionQuality,
     direction: detected.direction,
     directionConfidence: detected.directionConfidence,
     viewpoint,
@@ -52,8 +82,15 @@ export function analyzeGait(frames: readonly PoseFrame[]): GaitAnalysisResult {
     angles: excludeInvalidCyclePoints(filteredAngles, detected.cycles, validCycles),
     rawAngles: excludeInvalidCyclePoints(rawAngles, detected.cycles, validCycles),
     jointQuality: assessments.map((item) => item.report),
+    filterValidation,
     warnings
   };
+}
+
+function withFrameGeometry(frame: PoseFrame, metadata: VideoAnalysisMetadata | undefined): PoseFrame {
+  if ((frame.frameWidth ?? 0) > 0 && (frame.frameHeight ?? 0) > 0) return frame;
+  if (!metadata?.frameWidth || !metadata.frameHeight) return frame;
+  return { ...frame, frameWidth: metadata.frameWidth, frameHeight: metadata.frameHeight };
 }
 
 function emptyQuality(joint: Joint): JointQualityReport {
@@ -74,14 +111,27 @@ function frameSagittalScore(frame: ProcessedPoseFrame): number {
   const points = byIndex(frame);
   const leftShoulder = points.get(11); const rightShoulder = points.get(12);
   const leftHip = points.get(23); const rightHip = points.get(24);
-  if (!leftShoulder || !rightShoulder || !leftHip || !rightHip) return 0;
-  const shoulderMid = [(leftShoulder.x + rightShoulder.x) / 2, (leftShoulder.y + rightShoulder.y) / 2] as const;
-  const hipMid = [(leftHip.x + rightHip.x) / 2, (leftHip.y + rightHip.y) / 2] as const;
+  const width = frame.frameWidth; const height = frame.frameHeight;
+  if (!leftShoulder || !rightShoulder || !leftHip || !rightHip || !width || !height) return 0;
+  const shoulderMid = [
+    (leftShoulder.x + rightShoulder.x) * width / 2,
+    (leftShoulder.y + rightShoulder.y) * height / 2
+  ] as const;
+  const hipMid = [
+    (leftHip.x + rightHip.x) * width / 2,
+    (leftHip.y + rightHip.y) * height / 2
+  ] as const;
   const torso = Math.hypot(shoulderMid[0] - hipMid[0], shoulderMid[1] - hipMid[1]);
   if (torso <= 1e-5) return 0;
-  const shoulderWidth = Math.hypot(leftShoulder.x - rightShoulder.x, leftShoulder.y - rightShoulder.y) / torso;
-  const hipWidth = Math.hypot(leftHip.x - rightHip.x, leftHip.y - rightHip.y) / torso;
-  const shoulderDepth = Math.abs(leftShoulder.z - rightShoulder.z) / torso;
+  const shoulderWidth = Math.hypot(
+    (leftShoulder.x - rightShoulder.x) * width,
+    (leftShoulder.y - rightShoulder.y) * height
+  ) / torso;
+  const hipWidth = Math.hypot(
+    (leftHip.x - rightHip.x) * width,
+    (leftHip.y - rightHip.y) * height
+  ) / torso;
+  const shoulderDepth = Math.abs(leftShoulder.z - rightShoulder.z) * width / torso;
   return 0.35 * clamp((1.05 - shoulderWidth) / 0.65)
     + 0.35 * clamp((0.70 - hipWidth) / 0.45)
     + 0.30 * clamp((shoulderDepth - 0.50) / 1.50);
@@ -165,25 +215,36 @@ export function detectEvents(frames: readonly ProcessedPoseFrame[], fps: number)
     const indices = SIDE_INDICES[side];
     const heel = relativeSignal(frames, indices.heel, indices.hip, directionSign);
     const toe = relativeSignal(frames, indices.toe, indices.hip, directionSign);
+    const ankle = relativeSignal(frames, indices.ankle, indices.hip, directionSign);
     const heelSignal = fillForPeaks(heel.values); const toeSignal = fillForPeaks(toe.values);
+    const ankleSignal = fillForPeaks(ankle.values);
     if (!heelSignal || !toeSignal) { warnings.push(`${side === "left" ? "左" : "右"}下肢の接地・離地候補を検出できませんでした。`); continue; }
     const heelThreshold = Math.max(0.008, standardDeviation(heelSignal) * 0.20);
     const toeThreshold = Math.max(0.008, standardDeviation(toeSignal) * 0.20);
+    const heelAnkleAgreement = ankleSignal ? correlationScore(heelSignal, ankleSignal) : 0.5;
+    const toeAnkleAgreement = ankleSignal ? correlationScore(toeSignal, ankleSignal) : 0.5;
     for (const peak of findPeaks(heelSignal, minimumDistance, heelThreshold)) {
       events.push({ eventType: "IC", side, timestampMs: frames[peak.position]!.timestampMs,
         frameIndex: frames[peak.position]!.frameIndex,
-        confidence: eventConfidence(peak.prominence, heelThreshold, heel.confidence[peak.position]!, directionConfidence) });
+        confidence: eventConfidence(
+          peak.prominence, heelThreshold, heel.confidence[peak.position]!, directionConfidence,
+          motionConsistency(heelSignal, peak.position), heelAnkleAgreement
+        ) });
     }
     for (const peak of findPeaks(toeSignal.map((value) => -value), minimumDistance, toeThreshold)) {
       events.push({ eventType: "TO", side, timestampMs: frames[peak.position]!.timestampMs,
         frameIndex: frames[peak.position]!.frameIndex,
-        confidence: eventConfidence(peak.prominence, toeThreshold, toe.confidence[peak.position]!, directionConfidence) });
+        confidence: eventConfidence(
+          peak.prominence, toeThreshold, toe.confidence[peak.position]!, directionConfidence,
+          motionConsistency(toeSignal.map((value) => -value), peak.position), toeAnkleAgreement
+        ) });
     }
   }
   events.sort((a, b) => a.timestampMs - b.timestampMs || a.side.localeCompare(b.side) || a.eventType.localeCompare(b.eventType));
-  const cycles = buildCycles(events);
+  const refinedEvents = applyContralateralTiming(events);
+  const cycles = buildCycles(refinedEvents);
   if (cycles.length < 2) warnings.push("解析可能な歩行周期が少ないため、平均値の信頼性が低いです。");
-  return { direction, directionConfidence, events, cycles, warnings };
+  return { direction, directionConfidence, events: refinedEvents, cycles, warnings };
 }
 
 function detectDirection(frames: readonly ProcessedPoseFrame[]): { direction: "left" | "right" | "unknown"; confidence: number } {
@@ -256,9 +317,54 @@ function findPeaks(values: readonly number[], minimumDistance: number, prominenc
   return accepted.sort((a, b) => a.position - b.position).map(({ position, prominence }) => ({ position, prominence }));
 }
 
-function eventConfidence(prominence: number, threshold: number, landmarkConfidence: number, directionConfidence: number): number {
+function eventConfidence(
+  prominence: number, threshold: number, landmarkConfidence: number, directionConfidence: number,
+  motionScore: number, distalAgreement: number
+): number {
   const signalScore = Math.min(1, prominence / Math.max(threshold * 3, 1e-6));
-  return round(clamp(0.55 * signalScore + 0.35 * landmarkConfidence + 0.10 * directionConfidence));
+  return round(clamp(
+    0.40 * signalScore + 0.25 * landmarkConfidence + 0.10 * directionConfidence
+    + 0.15 * motionScore + 0.10 * distalAgreement
+  ));
+}
+
+function motionConsistency(signal: readonly number[], position: number): number {
+  if (position < 2 || position >= signal.length - 2) return 0.5;
+  const beforeVelocity = (signal[position]! - signal[position - 2]!) / 2;
+  const afterVelocity = (signal[position + 2]! - signal[position]!) / 2;
+  const reversal = beforeVelocity > 0 && afterVelocity < 0 ? 1 : 0;
+  const curvature = Math.abs(signal[position - 1]! - 2 * signal[position]! + signal[position + 1]!);
+  const curvatureScale = Math.max(standardDeviation(signal) * 0.10, 1e-6);
+  return 0.65 * reversal + 0.35 * clamp(curvature / curvatureScale);
+}
+
+function correlationScore(first: readonly number[], second: readonly number[]): number {
+  if (first.length !== second.length || first.length < 3) return 0.5;
+  const firstMean = mean(first); const secondMean = mean(second);
+  let numerator = 0; let firstEnergy = 0; let secondEnergy = 0;
+  for (let index = 0; index < first.length; index += 1) {
+    const a = first[index]! - firstMean; const b = second[index]! - secondMean;
+    numerator += a * b; firstEnergy += a * a; secondEnergy += b * b;
+  }
+  if (firstEnergy <= 1e-9 || secondEnergy <= 1e-9) return 0.5;
+  return clamp((numerator / Math.sqrt(firstEnergy * secondEnergy) + 1) / 2);
+}
+
+function applyContralateralTiming(events: readonly GaitEvent[]): GaitEvent[] {
+  const contacts = events.filter((event) => event.eventType === "IC");
+  const strides = SIDES.flatMap((side) => {
+    const sideEvents = contacts.filter((event) => event.side === side);
+    return sideEvents.slice(1).map((event, index) => event.timestampMs - sideEvents[index]!.timestampMs)
+      .filter((duration) => duration >= 700 && duration <= 2500);
+  });
+  const typicalStride = strides.length ? median(strides) : 1000;
+  return events.map((event) => {
+    const opposite = events.filter((candidate) => candidate.eventType === event.eventType && candidate.side !== event.side);
+    if (!opposite.length) return event;
+    const nearestDistance = Math.min(...opposite.map((candidate) => Math.abs(candidate.timestampMs - event.timestampMs)));
+    const timingScore = clamp(1 - Math.abs(nearestDistance - typicalStride / 2) / (typicalStride * 0.35));
+    return { ...event, confidence: round(0.85 * event.confidence + 0.15 * timingScore) };
+  });
 }
 
 function buildCycles(events: readonly GaitEvent[]): GaitCycle[] {
@@ -289,27 +395,49 @@ function buildCycles(events: readonly GaitEvent[]): GaitCycle[] {
   return filtered.sort((a, b) => a.startMs - b.startMs);
 }
 
-export function calculateJointAngles(frames: readonly { timestampMs: number; landmarks: readonly PoseLandmark[] }[], cycles: readonly GaitCycle[], direction: string): AnglePoint[] {
+export function calculateJointAngles(
+  frames: readonly { timestampMs: number; landmarks: readonly PoseLandmark[]; frameWidth?: number; frameHeight?: number }[],
+  cycles: readonly GaitCycle[],
+  direction: string
+): AnglePoint[] {
   const directionSign = direction === "left" ? -1 : 1;
   const points: AnglePoint[] = [];
   for (const frame of frames) {
+    if (!frame.frameWidth || !frame.frameHeight) continue;
     const landmarks = byIndex(frame);
     for (const side of SIDES) {
       const index = SIDE_INDICES[side];
       const shoulder = landmarks.get(index.shoulder); const hip = landmarks.get(index.hip);
       const knee = landmarks.get(index.knee); const ankle = landmarks.get(index.ankle);
       const heel = landmarks.get(index.heel); const toe = landmarks.get(index.toe);
-      if (!shoulder || !hip || !knee || !ankle || !heel || !toe) continue;
-      const mapped = [shoulder, hip, knee, ankle, heel, toe].map((item) => [directionSign * item.x, -item.y] as const);
-      const [shoulderP, hipP, kneeP, ankleP, heelP, toeP] = mapped as [readonly [number, number], readonly [number, number], readonly [number, number], readonly [number, number], readonly [number, number], readonly [number, number]];
-      const angles: { joint: Joint; angle: number; confidence: number }[] = [
-        { joint: "hip_flexion", angle: signedAngle(vector(shoulderP, hipP), vector(hipP, kneeP)),
-          confidence: landmarkConfidence([shoulder, hip, knee]) },
-        { joint: "knee_flexion", angle: 180 - unsignedAngle(vector(kneeP, hipP), vector(kneeP, ankleP)),
-          confidence: landmarkConfidence([hip, knee, ankle]) },
-        { joint: "ankle_dorsiflexion", angle: 90 - unsignedAngle(vector(ankleP, kneeP), vector(heelP, toeP)),
-          confidence: 0.75 * landmarkConfidence([knee, ankle, heel, toe]) }
+      const pixel = (item: PoseLandmark): readonly [number, number] => [
+        directionSign * item.x * frame.frameWidth!, -item.y * frame.frameHeight!
       ];
+      const angles: { joint: Joint; angle: number; confidence: number }[] = [];
+      if (shoulder && hip && knee) {
+        const shoulderP = pixel(shoulder); const hipP = pixel(hip); const kneeP = pixel(knee);
+        angles.push({
+          joint: "hip_flexion",
+          angle: signedAngle(vector(shoulderP, hipP), vector(hipP, kneeP)),
+          confidence: landmarkConfidence([shoulder, hip, knee])
+        });
+      }
+      if (hip && knee && ankle) {
+        const hipP = pixel(hip); const kneeP = pixel(knee); const ankleP = pixel(ankle);
+        angles.push({
+          joint: "knee_flexion",
+          angle: 180 - unsignedAngle(vector(kneeP, hipP), vector(kneeP, ankleP)),
+          confidence: landmarkConfidence([hip, knee, ankle])
+        });
+      }
+      if (knee && ankle && heel && toe) {
+        const kneeP = pixel(knee); const ankleP = pixel(ankle); const heelP = pixel(heel); const toeP = pixel(toe);
+        angles.push({
+          joint: "ankle_dorsiflexion",
+          angle: 90 - unsignedAngle(vector(ankleP, kneeP), vector(heelP, toeP)),
+          confidence: 0.75 * landmarkConfidence([knee, ankle, heel, toe])
+        });
+      }
       const cyclePercent = findCyclePercent(frame.timestampMs, side, cycles);
       for (const value of angles) {
         const bounds: Record<Joint, readonly [number, number]> = {
@@ -346,15 +474,16 @@ function findCyclePercent(timestampMs: number, side: Side, cycles: readonly Gait
 interface Assessment { report: JointQualityReport; validCycleKeys: Set<string> }
 function assessJoint(
   joint: Joint, rawFrames: readonly PoseFrame[], filteredFrames: readonly ProcessedPoseFrame[],
-  angles: readonly AnglePoint[], cycles: readonly GaitCycle[], direction: string
+  angles: readonly AnglePoint[], cycles: readonly GaitCycle[], direction: string, primarySide: Side | null
 ): Assessment {
-  const expectedLandmarks = Math.max(1, rawFrames.length * SIDES.reduce((sum, side) => sum + JOINT_LANDMARKS[joint][side].length, 0));
-  const expectedJointFrames = Math.max(1, filteredFrames.length * 2);
+  const qualitySides: readonly Side[] = primarySide ? [primarySide] : SIDES;
+  const expectedLandmarks = Math.max(1, rawFrames.length * qualitySides.reduce((sum, side) => sum + JOINT_LANDMARKS[joint][side].length, 0));
+  const expectedJointFrames = Math.max(1, filteredFrames.length * qualitySides.length);
   const visibility: number[] = []; const presence: number[] = [];
   let outliers = 0; let interpolated = 0; let completeJointFrames = 0;
   rawFrames.forEach((rawFrame, frameIndex) => {
     const raw = byIndex(rawFrame); const filtered = byIndex(filteredFrames[frameIndex]!);
-    for (const side of SIDES) {
+    for (const side of qualitySides) {
       const indices = JOINT_LANDMARKS[joint][side];
       const rawRequired = indices.map((index) => raw.get(index));
       const filteredRequired = indices.map((index) => filtered.get(index));
@@ -372,7 +501,7 @@ function assessJoint(
       .filter(({ frame }) => frame.timestampMs >= cycle.startMs && frame.timestampMs <= cycle.endMs);
     const expected = positions.length;
     const available = jointAngles.filter((point) => point.side === cycle.side && point.timestampMs >= cycle.startMs && point.timestampMs <= cycle.endMs).length;
-    expectedCycleSamples += expected;
+    if (qualitySides.includes(cycle.side)) expectedCycleSamples += expected;
     const indices = JOINT_LANDMARKS[joint][cycle.side];
     const rawSamples = positions.flatMap(({ index }) => rawFrames[index]!.landmarks.filter((item) => indices.includes(item.index)));
     const processedSamples = positions.flatMap(({ frame }) => frame.landmarks.filter((item) => indices.includes(item.index)));
@@ -384,16 +513,20 @@ function assessJoint(
     const maximumInterpolation = joint === "ankle_dorsiflexion" ? 0.15 : 0.20;
     const maximumOutliers = joint === "ankle_dorsiflexion" ? 0.10 : 0.15;
     if (expected >= 5 && available / expected >= minimumCoverage && cycleConfidence >= 0.50
+      && cycle.confidence >= 0.50
       && cycleInterpolation <= maximumInterpolation && cycleOutliers <= maximumOutliers) validCycleKeys.add(cycleKey(cycle));
   }
   const meanVisibility = mean(visibility); const meanPresence = mean(presence);
   const outlierRate = outliers / expectedLandmarks; const interpolationRate = interpolated / expectedLandmarks;
   const continuity = completeJointFrames / expectedJointFrames;
-  const usableRate = Math.min(1, jointAngles.length / Math.max(1, expectedCycleSamples));
-  const excludedCycles = Math.max(0, cycles.length - validCycleKeys.size);
+  const qualityAngles = jointAngles.filter((point) => qualitySides.includes(point.side));
+  const usableRate = Math.min(1, qualityAngles.length / Math.max(1, expectedCycleSamples));
+  const qualityCycles = cycles.filter((cycle) => qualitySides.includes(cycle.side));
+  const validQualityCycles = qualityCycles.filter((cycle) => validCycleKeys.has(cycleKey(cycle))).length;
+  const excludedCycles = Math.max(0, qualityCycles.length - validQualityCycles);
   const jumpThreshold: Record<Joint, number> = { hip_flexion: 12, knee_flexion: 15, ankle_dorsiflexion: 10 };
   const changes: number[] = [];
-  for (const side of SIDES) {
+  for (const side of qualitySides) {
     const ordered = jointAngles.filter((point) => point.side === side).sort((a, b) => a.timestampMs - b.timestampMs);
     for (let index = 0; index < ordered.length - 1; index += 1) {
       const before = ordered[index]!; const after = ordered[index + 1]!;
@@ -406,22 +539,22 @@ function assessJoint(
     const sign = direction === "left" ? -1 : 1; const directions: boolean[] = [];
     for (const frame of filteredFrames) {
       const points = byIndex(frame);
-      for (const side of SIDES) {
+      for (const side of qualitySides) {
         const indices = JOINT_LANDMARKS[joint][side]; const heel = points.get(indices[2]!); const toe = points.get(indices[3]!);
         if (heel && toe) directions.push(sign * (toe.x - heel.x) > 0.005);
       }
     }
     segmentConsistency = directions.length ? directions.filter(Boolean).length / directions.length : 0;
   }
-  let difficult = validCycleKeys.size === 0 || continuity < 0.50 || usableRate < 0.35 || meanVisibility < 0.50 || meanPresence < 0.50;
+  let difficult = validQualityCycles === 0 || continuity < 0.50 || usableRate < 0.35 || meanVisibility < 0.50 || meanPresence < 0.50;
   let high: boolean;
   if (joint === "ankle_dorsiflexion") {
     difficult ||= continuity < 0.65 || usableRate < 0.50 || segmentConsistency < 0.40;
     high = meanVisibility >= 0.80 && meanPresence >= 0.80 && continuity >= 0.85 && usableRate >= 0.75
-      && outlierRate <= 0.05 && interpolationRate <= 0.08 && angleJumpRate <= 0.05 && segmentConsistency >= 0.80 && validCycleKeys.size >= 2;
+      && outlierRate <= 0.05 && interpolationRate <= 0.08 && angleJumpRate <= 0.05 && segmentConsistency >= 0.80 && validQualityCycles >= 2;
   } else {
     high = meanVisibility >= 0.75 && meanPresence >= 0.75 && continuity >= 0.80 && usableRate >= 0.70
-      && outlierRate <= 0.08 && interpolationRate <= 0.12 && angleJumpRate <= 0.08 && validCycleKeys.size >= 2;
+      && outlierRate <= 0.08 && interpolationRate <= 0.12 && angleJumpRate <= 0.08 && validQualityCycles >= 2;
   }
   const status = difficult ? "difficult" : high ? "high" : "caution";
   const warnings: string[] = [];
@@ -435,7 +568,7 @@ function assessJoint(
     outlierRate: round(outlierRate, 4), interpolationRate: round(interpolationRate, 4),
     trackingContinuity: round(continuity, 4), usablePointRate: round(usableRate, 4),
     angleJumpRate: round(angleJumpRate, 4), segmentConsistency: round(segmentConsistency, 4),
-    validCycleCount: validCycleKeys.size, excludedCycleCount: excludedCycles, warnings
+    validCycleCount: validQualityCycles, excludedCycleCount: excludedCycles, warnings
   }, validCycleKeys };
 }
 
@@ -446,4 +579,61 @@ function excludeInvalidCyclePoints(points: readonly AnglePoint[], cycles: readon
     const cycle = cycles.find((item) => item.side === point.side && point.timestampMs >= item.startMs && point.timestampMs <= item.endMs);
     return cycle ? valid.get(point.joint)?.has(cycleKey(cycle)) : false;
   });
+}
+
+function validateFilterCandidates(
+  frames: readonly PoseFrame[], viewpoint: ViewpointReport, cycles: readonly GaitCycle[],
+  direction: string, sixHzAngles: readonly AnglePoint[]
+): FilterCandidateValidation[] {
+  const rawFrames = selectAnalysisFrames(frames, viewpoint);
+  const rawAngles = calculateJointAngles(rawFrames, cycles, direction);
+  const candidates = new Map<number, AnglePoint[]>();
+  candidates.set(6, [...sixHzAngles]);
+  for (const cutoff of [4, 8] as const) {
+    const processed = processLandmarks(frames, 0.5, 100, cutoff);
+    candidates.set(cutoff, calculateJointAngles(
+      selectAnalysisFrames(processed.frames, viewpoint), cycles, direction
+    ));
+  }
+  const output: FilterCandidateValidation[] = [];
+  for (const cutoff of [4, 6, 8] as const) {
+    const candidateAngles = candidates.get(cutoff)!;
+    for (const joint of JOINTS) {
+      for (const side of SIDES) {
+        const raw = rawAngles.filter((point) => point.joint === joint && point.side === side && point.cyclePercent !== null);
+        const candidate = candidateAngles.filter((point) => point.joint === joint && point.side === side && point.cyclePercent !== null);
+        const candidateByTime = new Map(candidate.map((point) => [point.timestampMs, point.angleDegrees]));
+        const pairs = raw.map((point) => [point.angleDegrees, candidateByTime.get(point.timestampMs)] as const)
+          .filter((pair): pair is readonly [number, number] => pair[1] !== undefined);
+        if (pairs.length < 5) continue;
+        const rawValues = pairs.map((pair) => pair[0]); const filteredValues = pairs.map((pair) => pair[1]);
+        const rawRom = Math.max(...rawValues) - Math.min(...rawValues);
+        const filteredRom = Math.max(...filteredValues) - Math.min(...filteredValues);
+        output.push({
+          cutoffHz: cutoff,
+          joint,
+          side,
+          highFrequencyResidual: round(Math.sqrt(mean(pairs.map(([rawValue, filteredValue]) => (rawValue - filteredValue) ** 2))), 4),
+          peakAttenuation: round(Math.max(...rawValues) - Math.max(...filteredValues), 4),
+          romAttenuation: round(rawRom - filteredRom, 4)
+        });
+      }
+    }
+  }
+  return output;
+}
+
+export function representativeWaveform(
+  points: readonly AnglePoint[], joint: Joint, side: Side, method: "median" | "mean" = "median"
+): { percent: number; value: number }[] {
+  const buckets = new Map<number, number[]>();
+  for (const point of points) {
+    if (point.joint !== joint || point.side !== side || point.cyclePercent === null || point.confidence < 0.5) continue;
+    const percent = Math.max(0, Math.min(100, Math.round(point.cyclePercent)));
+    const values = buckets.get(percent) ?? [];
+    values.push(point.angleDegrees); buckets.set(percent, values);
+  }
+  return [...buckets.entries()].sort(([a], [b]) => a - b).map(([percent, values]) => ({
+    percent, value: method === "median" ? median(values) : mean(values)
+  }));
 }

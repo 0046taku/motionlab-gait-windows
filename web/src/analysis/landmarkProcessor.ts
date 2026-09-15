@@ -81,6 +81,8 @@ export function processLandmarks(
   const processedFrames = frames.map<ProcessedPoseFrame>((source, framePosition) => ({
     frameIndex: source.frameIndex,
     timestampMs: source.timestampMs,
+    frameWidth: source.frameWidth,
+    frameHeight: source.frameHeight,
     landmarks: Array.from({ length: LANDMARK_COUNT }, (_, index) => index)
       .filter((index) => coords[framePosition]![index]!.slice(0, 3).every(Number.isFinite))
       .map((index) => ({
@@ -244,4 +246,3 @@ function smoothFiniteSegments(values: readonly number[], fps: number, cutoffHz: 
   }
   return output;
 }
-

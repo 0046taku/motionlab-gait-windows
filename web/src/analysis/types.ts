@@ -1,4 +1,4 @@
-import type { PoseFrame, PoseLandmark } from "../domain/models";
+import type { PoseFrame, PoseLandmark, VideoAnalysisMetadata } from "../domain/models";
 
 export type Side = "left" | "right";
 export type Joint = "hip_flexion" | "knee_flexion" | "ankle_dorsiflexion";
@@ -78,9 +78,41 @@ export interface JointQualityReport {
   warnings: string[];
 }
 
+export interface AcquisitionQuality {
+  status: "high" | "caution" | "retake";
+  reasons: string[];
+  fullBodyCoverage: number;
+  footCoverage: number;
+  primaryLimbCoverage: number;
+  cameraStability: number;
+  sideViewScore: number;
+  cycleCount: number;
+}
+
+export interface FilterCandidateValidation {
+  cutoffHz: 4 | 6 | 8;
+  joint: Joint;
+  side: Side;
+  highFrequencyResidual: number;
+  peakAttenuation: number;
+  romAttenuation: number;
+}
+
+export interface AnalysisVersions {
+  analysisVersion: "motionlab-gait-web/0.3.0";
+  poseModelVersion: "@mediapipe/tasks-vision@1.0.1/pose_landmarker_full";
+  filterVersion: "butterworth4-zero-phase-v1";
+  angleDefinitionVersion: "sagittal-pixel-v2";
+  eventDetectorVersion: "multisignal-v2";
+}
+
 export interface GaitAnalysisResult {
-  analysisVersion: "motionlab-gait-web/0.2.0";
+  analysisVersion: "motionlab-gait-web/0.3.0";
+  versions: AnalysisVersions;
   fps: number;
+  videoMetadata?: VideoAnalysisMetadata;
+  primarySide: Side | null;
+  acquisitionQuality: AcquisitionQuality;
   direction: "left" | "right" | "unknown";
   directionConfidence: number;
   viewpoint: ViewpointReport;
@@ -90,6 +122,6 @@ export interface GaitAnalysisResult {
   angles: AnglePoint[];
   rawAngles: AnglePoint[];
   jointQuality: JointQualityReport[];
+  filterValidation: FilterCandidateValidation[];
   warnings: string[];
 }
-

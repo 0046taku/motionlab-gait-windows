@@ -1,6 +1,6 @@
 import { normalReference, REFERENCE_LABEL } from "../analysis/normalReference";
-import { median } from "../analysis/statistics";
-import type { AnglePoint, GaitAnalysisResult, Joint, Side } from "../analysis/types";
+import { representativeWaveform } from "../analysis/gaitAnalysis";
+import type { GaitAnalysisResult, Joint, Side } from "../analysis/types";
 
 const JOINT_LABELS: Record<Joint, string> = {
   hip_flexion: "股関節屈曲",
@@ -51,6 +51,11 @@ export class AnalysisResultsView {
     const quality = this.result.jointQuality.find((item) => item.joint === this.joint);
     const statusLabel = quality ? { high: "高", caution: "注意", difficult: "解析困難" }[quality.status] : "解析困難";
     const statusClass = quality?.status ?? "difficult";
+    if (this.result.acquisitionQuality.status === "retake") {
+      content.innerHTML = `<div class="quality-row"><span class="quality-badge difficult">撮影品質：撮り直し推奨</span></div>
+        <div class="analysis-empty"><strong>正確な解析が難しいため、撮り直しをおすすめします</strong><p>${this.result.acquisitionQuality.reasons.join(" ")}</p></div>`;
+      return;
+    }
     if (!this.result.viewpoint.analysisSupported) {
       content.innerHTML = `<div class="analysis-empty"><strong>歩行イベントを確認してください</strong><p>${this.result.viewpoint.warnings.join(" ")}</p></div>`;
       return;
@@ -60,8 +65,8 @@ export class AnalysisResultsView {
         <div class="analysis-empty"><strong>歩行イベントを確認してください</strong><p>${quality?.warnings.join(" ") || "この関節の有効な歩行周期を取得できませんでした。"}</p></div>`;
       return;
     }
-    const buckets = buildBuckets(this.result.angles, this.joint);
-    const left = bucketSeries(buckets, "left"); const right = bucketSeries(buckets, "right");
+    const left = representativeWaveform(this.result.angles, this.joint, "left", "median");
+    const right = representativeWaveform(this.result.angles, this.joint, "right", "median");
     const references = this.showReference ? normalReference(this.joint) : [];
     const allValues = [...left.map((point) => point.value), ...right.map((point) => point.value), ...references.map((point) => point.mean)];
     if (!allValues.length) {
@@ -70,11 +75,14 @@ export class AnalysisResultsView {
       return;
     }
     const axis = niceAxis(allValues);
-    const chart = renderChart(left, right, references, axis.minimum, axis.maximum, axis.step, this.joint);
+    const chart = renderChart(
+      left, right, references, axis.minimum, axis.maximum, axis.step, this.joint, this.result.primarySide
+    );
     const ankleSuffix = this.joint === "ankle_dorsiflexion" && quality.status === "caution" ? "（参考値）" : "";
     content.innerHTML = `
       <div class="quality-row">
         <span class="quality-badge ${statusClass}">測定品質：${statusLabel}${ankleSuffix}</span>
+        ${this.result.primarySide ? `<span class="primary-side">Primary：${this.result.primarySide === "left" ? "左" : "右"}（カメラ側）</span>` : ""}
         <label class="reference-toggle"><input id="reference-toggle" type="checkbox" ${this.showReference ? "checked" : ""} />参考波形</label>
       </div>
       ${quality.warnings.length ? `<p class="joint-warning">${quality.warnings.join(" ")}</p>` : ""}
@@ -93,25 +101,6 @@ export class AnalysisResultsView {
 }
 
 type SeriesPoint = { percent: number; value: number };
-function buildBuckets(points: readonly AnglePoint[], joint: Joint): Map<string, number[]> {
-  const buckets = new Map<string, number[]>();
-  for (const point of points) {
-    if (point.joint !== joint || point.cyclePercent === null || point.confidence < 0.5) continue;
-    const percent = Math.max(0, Math.min(100, Math.round(point.cyclePercent)));
-    const key = `${point.side}:${percent}`;
-    const values = buckets.get(key) ?? [];
-    values.push(point.angleDegrees); buckets.set(key, values);
-  }
-  return buckets;
-}
-function bucketSeries(buckets: Map<string, number[]>, side: Side): SeriesPoint[] {
-  const output: SeriesPoint[] = [];
-  for (let percent = 0; percent <= 100; percent += 1) {
-    const values = buckets.get(`${side}:${percent}`);
-    if (values?.length) output.push({ percent, value: median(values) });
-  }
-  return output;
-}
 function summaryMetric(side: string, points: readonly SeriesPoint[]): string {
   if (!points.length) return `<div class="analysis-metric"><span>${side}</span><strong>算出不可</strong><small>有効値なし</small></div>`;
   const values = points.map((point) => point.value); const minimum = Math.min(...values); const maximum = Math.max(...values);
@@ -128,7 +117,8 @@ function niceAxis(values: readonly number[]): { minimum: number; maximum: number
 }
 function renderChart(
   left: readonly SeriesPoint[], right: readonly SeriesPoint[],
-  reference: readonly { percent: number; mean: number }[], minimum: number, maximum: number, step: number, joint: Joint
+  reference: readonly { percent: number; mean: number }[], minimum: number, maximum: number, step: number,
+  joint: Joint, primarySide: Side | null
 ): string {
   const width = 720; const height = 360; const margin = { left: 64, right: 24, top: 52, bottom: 58 };
   const plotWidth = width - margin.left - margin.right; const plotHeight = height - margin.top - margin.bottom;
@@ -138,18 +128,15 @@ function renderChart(
   const yTicks: number[] = [];
   for (let value = minimum; value <= maximum + step * 0.1; value += step) yTicks.push(value);
   const referencePoints = reference.map((point) => ({ percent: point.percent, value: point.mean }));
-  const zeroLine = minimum <= 0 && maximum >= 0 ? `<line class="chart-zero" x1="${x(0)}" x2="${x(100)}" y1="${y(0)}" y2="${y(0)}" />` : "";
   return `<svg class="joint-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="${JOINT_LABELS[joint]}の左・右波形">
     <text class="chart-title" x="${width / 2}" y="25" text-anchor="middle">${JOINT_LABELS[joint]}</text>
     ${yTicks.map((value) => `<line class="chart-grid" x1="${x(0)}" x2="${x(100)}" y1="${y(value)}" y2="${y(value)}"/><text class="chart-tick" x="${margin.left - 10}" y="${y(value) + 4}" text-anchor="end">${value.toFixed(0)}</text>`).join("")}
     ${[0, 25, 50, 75, 100].map((value) => `<line class="chart-grid vertical" x1="${x(value)}" x2="${x(value)}" y1="${margin.top}" y2="${height - margin.bottom}"/><text class="chart-tick" x="${x(value)}" y="${height - margin.bottom + 22}" text-anchor="middle">${value}</text>`).join("")}
-    ${zeroLine}
     ${reference.length ? `<path class="chart-reference" d="${path(referencePoints)}"/>` : ""}
-    ${left.length ? `<path class="chart-wave left" d="${path(left)}"/>` : ""}
-    ${right.length ? `<path class="chart-wave right" d="${path(right)}"/>` : ""}
-    <g class="chart-legend"><line x1="${width - 164}" x2="${width - 140}" y1="25" y2="25" stroke="${SIDE_COLORS.left}" stroke-width="3"/><text x="${width - 134}" y="29">左</text><line x1="${width - 94}" x2="${width - 70}" y1="25" y2="25" stroke="${SIDE_COLORS.right}" stroke-width="3"/><text x="${width - 64}" y="29">右</text></g>
+    ${left.length ? `<path class="chart-wave left${primarySide === "left" ? " primary" : primarySide === "right" ? " secondary-limb" : ""}" d="${path(left)}"/>` : ""}
+    ${right.length ? `<path class="chart-wave right${primarySide === "right" ? " primary" : primarySide === "left" ? " secondary-limb" : ""}" d="${path(right)}"/>` : ""}
+    <g class="chart-legend"><line x1="${width - 178}" x2="${width - 154}" y1="25" y2="25" stroke="${SIDE_COLORS.left}" stroke-width="3"/><text x="${width - 148}" y="29">左${primarySide === "left" ? "*" : ""}</text><line x1="${width - 98}" x2="${width - 74}" y1="25" y2="25" stroke="${SIDE_COLORS.right}" stroke-width="3"/><text x="${width - 68}" y="29">右${primarySide === "right" ? "*" : ""}</text></g>
     <text class="chart-axis-label" x="${width / 2}" y="${height - 10}" text-anchor="middle">歩行周期（%）</text>
     <text class="chart-axis-label" transform="translate(17 ${height / 2}) rotate(-90)" text-anchor="middle">角度（°）</text>
   </svg>`;
 }
-
