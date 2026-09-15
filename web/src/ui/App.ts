@@ -1,7 +1,10 @@
 import type { Patient, VideoStudy } from "../domain/models";
+import { analyzeGait } from "../analysis/gaitAnalysis";
+import type { GaitAnalysisResult } from "../analysis/types";
 import { nearestPoseFrame, SkeletonRenderer } from "../overlay/SkeletonRenderer";
 import { MotionLabDatabase } from "../storage/database";
 import { VideoPoseAnalyzer } from "../video/VideoPoseAnalyzer";
+import { AnalysisResultsView } from "./AnalysisResultsView";
 
 export class App {
   private readonly database = new MotionLabDatabase();
@@ -13,6 +16,8 @@ export class App {
   private analyzer: VideoPoseAnalyzer | null = null;
   private videoFrameHandle: number | null = null;
   private overlayResizeObserver: ResizeObserver | null = null;
+  private viewerTab: "video" | "analysis" = "video";
+  private readonly gaitAnalysisCache = new Map<string, GaitAnalysisResult>();
 
   constructor(private readonly root: HTMLElement) {}
 
@@ -129,6 +134,7 @@ export class App {
     this.selectedPatientId = patientId;
     this.videos = await this.database.listVideos(patientId);
     this.selectedVideoId = this.videos[0]?.id ?? null;
+    this.viewerTab = "video";
     this.renderPatientList();
     this.renderContent();
   }
@@ -232,6 +238,7 @@ export class App {
       button.append(name, meta);
       button.addEventListener("click", () => {
         this.selectedVideoId = video.id;
+        this.viewerTab = "video";
         this.renderContent();
       });
       list.append(button);
@@ -246,21 +253,59 @@ export class App {
         <p class="notice">本アプリは診断装置ではありません。動画とSkeletonを確認し、結果を単独で治療判断に使用しないでください。</p>`;
       return;
     }
-    viewer.innerHTML = `<div class="video-stage">
-        <video id="player" controls playsinline webkit-playsinline preload="metadata"></video>
-        <canvas id="skeleton-canvas" aria-hidden="true"></canvas>
+    const tabs = study.status === "ready" ? `<div class="viewer-tabs" role="tablist" aria-label="動画表示">
+      <button id="video-view-tab" class="viewer-tab${this.viewerTab === "video" ? " active" : ""}" type="button" role="tab" aria-selected="${this.viewerTab === "video"}" aria-controls="video-view-panel">動画・Skeleton</button>
+      <button id="analysis-view-tab" class="viewer-tab${this.viewerTab === "analysis" ? " active" : ""}" type="button" role="tab" aria-selected="${this.viewerTab === "analysis"}" aria-controls="analysis-view-panel">解析結果</button>
+    </div>` : "";
+    viewer.innerHTML = `${tabs}
+      <div id="video-view-panel" class="viewer-panel" role="tabpanel" ${this.viewerTab === "analysis" && study.status === "ready" ? "hidden" : ""}>
+        <div class="video-stage">
+          <video id="player" controls playsinline webkit-playsinline preload="metadata"></video>
+          <canvas id="skeleton-canvas" aria-hidden="true"></canvas>
+        </div>
+        <div id="analysis-progress" class="progress-box" hidden>
+          <div class="progress-row"><span id="progress-message">準備中</span><span id="progress-percent">0%</span></div>
+          <progress id="progress-bar" value="0" max="1"></progress>
+          <button id="cancel-analysis" class="button ghost small" type="button">解析を中止</button>
+        </div>
+        <div id="result-summary"></div>
       </div>
-      <div id="analysis-progress" class="progress-box" hidden>
-        <div class="progress-row"><span id="progress-message">準備中</span><span id="progress-percent">0%</span></div>
-        <progress id="progress-bar" value="0" max="1"></progress>
-        <button id="cancel-analysis" class="button ghost small" type="button">解析を中止</button>
-      </div>
-      <div id="result-summary"></div>`;
+      ${study.status === "ready" ? `<div id="analysis-view-panel" class="viewer-panel" role="tabpanel" ${this.viewerTab === "video" ? "hidden" : ""}></div>` : ""}`;
     const player = this.requireElement<HTMLVideoElement>("player");
     this.objectUrl = URL.createObjectURL(study.video);
     player.src = this.objectUrl;
     if (study.status === "ready") this.attachOverlay(player, study);
     this.renderResultSummary(study);
+    if (study.status === "ready") {
+      this.requireElement("video-view-tab").addEventListener("click", () => this.selectViewerTab("video", study));
+      this.requireElement("analysis-view-tab").addEventListener("click", () => this.selectViewerTab("analysis", study));
+      if (this.viewerTab === "analysis") this.renderAnalysisResults(study);
+    }
+  }
+
+  private selectViewerTab(tab: "video" | "analysis", study: VideoStudy): void {
+    this.viewerTab = tab;
+    const videoTab = this.requireElement<HTMLButtonElement>("video-view-tab");
+    const analysisTab = this.requireElement<HTMLButtonElement>("analysis-view-tab");
+    const videoPanel = this.requireElement<HTMLElement>("video-view-panel");
+    const analysisPanel = this.requireElement<HTMLElement>("analysis-view-panel");
+    videoTab.classList.toggle("active", tab === "video");
+    analysisTab.classList.toggle("active", tab === "analysis");
+    videoTab.setAttribute("aria-selected", String(tab === "video"));
+    analysisTab.setAttribute("aria-selected", String(tab === "analysis"));
+    videoPanel.hidden = tab !== "video";
+    analysisPanel.hidden = tab !== "analysis";
+    if (tab === "analysis") this.renderAnalysisResults(study);
+  }
+
+  private renderAnalysisResults(study: VideoStudy): void {
+    const panel = this.requireElement("analysis-view-panel");
+    let result = this.gaitAnalysisCache.get(study.id);
+    if (!result) {
+      result = analyzeGait(study.poseFrames);
+      this.gaitAnalysisCache.set(study.id, result);
+    }
+    new AnalysisResultsView(panel, result).render();
   }
 
   private renderResultSummary(study: VideoStudy): void {
@@ -282,7 +327,7 @@ export class App {
       <div class="metric"><span>33点検出率</span><strong>${detectionRate}%</strong></div>
       <div class="metric"><span>動画時間</span><strong>${(study.durationMs / 1000).toFixed(1)}秒</strong></div>
     </div>
-    <p class="notice">再生・停止・シークにSkeletonが追従します。Web版の定量的な関節角度はWindows版との数値一致を検証後に有効化します。</p>`;
+    <p class="notice">再生・停止・シークにSkeletonが追従します。関節角度は「解析結果」タブで確認できます。</p>`;
   }
 
   private async importVideo(file: File): Promise<void> {
@@ -325,6 +370,7 @@ export class App {
       study.durationMs = result.durationMs;
       study.poseFrames = result.frames;
       study.error = "";
+      this.gaitAnalysisCache.delete(study.id);
     } catch (error) {
       study.status = "failed";
       study.error = this.errorMessage(error);
