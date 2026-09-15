@@ -42,11 +42,17 @@ export interface PoseFrame {
 export interface CaptureConditions {
   gaitMode: "comfortable" | "maximum" | "unspecified";
   orthosis: "none" | "used" | "unspecified";
-  walkingAid: "none" | "used" | "unspecified";
+  walkingAid: "none" | "cane_single" | "cane_multi" | "walker" | "other" | "used" | "unspecified";
   cameraSide: "left" | "right" | "unspecified";
+  /** Optional research-protocol measurements; never required for routine care. */
+  cameraHeightCm?: number;
+  shootingDistanceCm?: number;
 }
 
 export interface VideoAnalysisMetadata {
+  /** Display-rotation-corrected source dimensions reported by the browser. */
+  sourceWidth?: number;
+  sourceHeight?: number;
   frameWidth: number;
   frameHeight: number;
   estimatedFps: number;

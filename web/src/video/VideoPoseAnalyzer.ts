@@ -90,6 +90,8 @@ export class VideoPoseAnalyzer {
         frames,
         durationMs: Math.round(video.duration * 1000),
         metadata: {
+          sourceWidth: video.videoWidth,
+          sourceHeight: video.videoHeight,
           frameWidth: canvas.width,
           frameHeight: canvas.height,
           estimatedFps,

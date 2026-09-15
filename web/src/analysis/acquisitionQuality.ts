@@ -45,6 +45,9 @@ export function assessAcquisitionQuality(
   if (cameraStability < 0.45) hardReasons.push("カメラ移動または画角変化の可能性があります");
   else if (cameraStability < 0.72) cautionReasons.push("カメラの固定状態を確認してください");
   if (metadata) {
+    const sourceWidth = metadata.sourceWidth ?? metadata.frameWidth;
+    const sourceHeight = metadata.sourceHeight ?? metadata.frameHeight;
+    if (sourceHeight > sourceWidth) hardReasons.push("動画が縦向きです。横向きで撮影してください");
     if (metadata.lowBrightnessRate > 0.60 || metadata.averageBrightness < 35) hardReasons.push("暗いフレームが多く、Pose追跡が不安定です");
     else if (metadata.lowBrightnessRate > 0.25 || metadata.averageBrightness < 55) cautionReasons.push("照明が不足している可能性があります");
     if (metadata.estimatedFps < 24) cautionReasons.push("動画fpsが低く、歩行イベントの時間精度に注意が必要です");

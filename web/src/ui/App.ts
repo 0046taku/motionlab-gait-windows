@@ -1,6 +1,7 @@
 import type { CaptureConditions, Patient, VideoStudy } from "../domain/models";
 import { analyzeGait } from "../analysis/gaitAnalysis";
 import type { GaitAnalysisResult } from "../analysis/types";
+import { compareCaptureConditions, previousReadyStudy } from "../capture/captureConditions";
 import { nearestPoseFrame, SkeletonRenderer } from "../overlay/SkeletonRenderer";
 import { MotionLabDatabase } from "../storage/database";
 import { VideoPoseAnalyzer } from "../video/VideoPoseAnalyzer";
@@ -194,9 +195,8 @@ export class App {
         <div class="video-actions">
           <button id="capture-video" class="button" type="button">カメラで撮影</button>
           <input id="video-capture" class="sr-only" type="file" accept="video/*" capture="environment" />
-          <label class="button secondary file-button">動画を選択
-            <input id="video-input" type="file" accept="video/mp4,video/quicktime,video/x-m4v,video/*" />
-          </label>
+          <button id="select-video" class="button secondary" type="button">動画を選択</button>
+          <input id="video-input" class="sr-only" type="file" accept="video/mp4,video/quicktime,video/x-m4v,video/*" />
           <button id="capture-manual" class="button ghost" type="button">撮影方法</button>
         </div>
       </div>
@@ -221,9 +221,16 @@ export class App {
       if (file) void this.importVideo(file, captureConditions).finally(() => { captureInput.value = ""; });
     });
     const videoInput = this.requireElement<HTMLInputElement>("video-input");
+    let selectionConditions = defaultCaptureConditions();
+    this.requireElement("select-video").addEventListener("click", () => {
+      this.captureGuide?.openForVideoSelection(patient, (conditions) => {
+        selectionConditions = conditions;
+        videoInput.click();
+      });
+    });
     videoInput.addEventListener("change", () => {
       const file = videoInput.files?.[0];
-      if (file) void this.importVideo(file, defaultCaptureConditions()).finally(() => { videoInput.value = ""; });
+      if (file) void this.importVideo(file, selectionConditions).finally(() => { videoInput.value = ""; });
     });
     this.requireElement("capture-manual").addEventListener("click", () => this.captureGuide?.openManual());
     this.renderStudyList();
@@ -353,6 +360,8 @@ export class App {
     const quality = result.acquisitionQuality;
     const qualityLabel = { high: "高", caution: "注意", retake: "撮り直し推奨" }[quality.status];
     const metadata = study.videoMetadata;
+    const previousStudy = previousReadyStudy(study, this.videos);
+    const comparison = previousStudy ? compareCaptureConditions(study, previousStudy) : null;
     container.innerHTML = `<div class="capture-quality ${quality.status}">
       <div><span>撮影品質</span><strong>${qualityLabel}</strong></div>
       ${quality.reasons.length ? `<ul>${quality.reasons.map((reason) => `<li>${reason}</li>`).join("")}</ul>` : `<p>側方性・足部追跡・歩行周期を確認できました。</p>`}
@@ -362,7 +371,14 @@ export class App {
       <div class="metric"><span>33点検出率</span><strong>${detectionRate}%</strong></div>
       <div class="metric"><span>解析fps</span><strong>${metadata ? metadata.estimatedFps.toFixed(1) : "—"}</strong></div>
     </div>
-    <p class="notice">${quality.status === "retake" ? "正確な解析が難しいため、撮り直しをおすすめします。" : "再生・停止・シークにSkeletonが追従します。関節角度は「解析結果」タブで確認できます。"}</p>`;
+    ${renderCaptureConditions(study)}
+    ${comparison ? renderConditionComparison(comparison.status, comparison.differences) : ""}
+    <p class="notice">${quality.status === "retake" ? "正確な解析が難しいため、撮り直しをおすすめします。" : "再生・停止・シークにSkeletonが追従します。関節角度は「解析結果」タブで確認できます。"}</p>
+    ${quality.status === "retake" ? `<div class="qc-actions"><button id="retake-video" class="button" type="button">撮り直す</button><button id="qc-view-manual" class="button ghost" type="button">撮影方法を見る</button></div>` : ""}`;
+    if (quality.status === "retake") {
+      this.requireElement("retake-video").addEventListener("click", () => this.requireElement<HTMLButtonElement>("capture-video").click());
+      this.requireElement("qc-view-manual").addEventListener("click", () => this.captureGuide?.openManual());
+    }
   }
 
   private async importVideo(file: File, captureConditions: CaptureConditions): Promise<void> {
@@ -486,4 +502,29 @@ function statusLabel(status: VideoStudy["status"]): string {
 
 function defaultCaptureConditions(): CaptureConditions {
   return { gaitMode: "unspecified", orthosis: "unspecified", walkingAid: "unspecified", cameraSide: "unspecified" };
+}
+
+function renderCaptureConditions(study: VideoStudy): string {
+  const conditions = study.captureConditions;
+  if (!conditions || [conditions.gaitMode, conditions.orthosis, conditions.walkingAid, conditions.cameraSide].includes("unspecified")) {
+    return `<p class="capture-condition-summary muted">撮影条件：記録なし</p>`;
+  }
+  const gait = conditions.gaitMode === "comfortable" ? "快適歩行" : "最大歩行";
+  const orthosis = conditions.orthosis === "none" ? "装具なし" : "装具あり";
+  const aid: Record<CaptureConditions["walkingAid"], string> = {
+    none: "補助具なし", cane_single: "T字杖", cane_multi: "多点杖", walker: "歩行器",
+    other: "その他の補助具", used: "補助具あり", unspecified: "補助具未記録"
+  };
+  const camera = conditions.cameraSide === "left" ? "左をカメラ側" : "右をカメラ側";
+  return `<p class="capture-condition-summary">撮影条件：${gait}・${orthosis}・${aid[conditions.walkingAid]}・${camera}</p>`;
+}
+
+function renderConditionComparison(status: "same" | "different" | "insufficient", differences: readonly string[]): string {
+  if (status === "different") {
+    return `<div class="condition-comparison warning"><strong>前回と撮影条件が異なります</strong><span>${differences.join("・")}</span></div>`;
+  }
+  if (status === "insufficient") {
+    return `<div class="condition-comparison neutral"><strong>前回との撮影条件比較：記録不足</strong><span>同条件か確認できません。</span></div>`;
+  }
+  return `<div class="condition-comparison"><strong>前回と同じ撮影条件です</strong><span>歩行速度・装具・補助具・カメラ側・fps</span></div>`;
 }

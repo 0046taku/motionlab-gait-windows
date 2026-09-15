@@ -130,6 +130,16 @@ describe("Windows gait-analysis parity", () => {
     expect(result.acquisitionQuality.reasons.some((reason) => reason.includes("踵・足先"))).toBe(true);
   });
 
+  it("recommends retaking a portrait video after automatic metadata review", () => {
+    const result = analyzeGait(walkingFrames(5), { videoMetadata: {
+      sourceWidth: 1080, sourceHeight: 1920, frameWidth: 640, frameHeight: 640,
+      estimatedFps: 60, timestampSource: "presentation_timestamps", averageBrightness: 100,
+      lowBrightnessRate: 0, analyzedFrameCount: 300
+    } });
+    expect(result.acquisitionQuality.status).toBe("retake");
+    expect(result.acquisitionQuality.reasons.some((reason) => reason.includes("横向き"))).toBe(true);
+  });
+
   it("removes a one-frame landmark excursion before zero-phase smoothing", () => {
     const frames = walkingFrames(4, 60);
     frames[90]!.landmarks[25] = { ...frames[90]!.landmarks[25]!, x: 2 };
