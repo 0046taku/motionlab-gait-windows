@@ -135,6 +135,7 @@ MediaPipe 1.0.1は「最新だから」ではなく、公式Tasks VIDEO API、Wi
 - [プライバシー設計](docs/privacy.md)
 - [Web/PWA移行設計案（調査のみ・未実装）](docs/web-pwa-migration-plan.md)
 - [v0.4 zero-phase実動画検証](docs/zero-phase-validation-v040.md)
+- [Web版 Accuracy Validation（camera-side / Manual Knee）](docs/web-accuracy-validation.md)
 
 ## データ保存とバックアップ
 

@@ -87,6 +87,58 @@ export interface AcquisitionQuality {
   cameraStability: number;
   sideViewScore: number;
   cycleCount: number;
+  cameraSideAgreement: "consistent" | "conflict" | "unknown";
+}
+
+export interface CameraSideCheck {
+  userSelectedSide: Side | null;
+  inferredSide: Side | null;
+  confidence: number;
+  agreement: "consistent" | "conflict" | "unknown";
+}
+
+export interface SegmentStabilityReport {
+  segment: "shoulder_hip" | "hip_knee" | "knee_ankle" | "heel_toe";
+  medianLengthPx: number;
+  coefficientOfVariation: number;
+  suddenChangeRate: number;
+}
+
+export interface CycleValidationReport {
+  side: Side;
+  startMs: number;
+  endMs: number;
+  centralityScore: number;
+  outOfPlaneRisk: number;
+  outOfPlaneFrameRate: number;
+  segmentInstabilityRate: number;
+  kinematicRiskRate: number;
+  selected: boolean;
+  reasons: string[];
+}
+
+export interface StaticStandingValidationReport {
+  method: "initial-window-validation-v1";
+  status: "candidate" | "moving" | "insufficient";
+  windowStartMs: number | null;
+  windowEndMs: number | null;
+  frameCount: number;
+  pelvisTravelTorsoRatio: number | null;
+  cameraSideCoverage: number;
+  kneeRawJitterDegrees: number | null;
+  segmentLengthCoefficientOfVariation: number | null;
+  ankleNeutralCandidateDegrees: number | null;
+  /** This report never changes raw or filtered joint angles. */
+  appliedAsCalibration: false;
+}
+
+export interface SpatialValidationReport {
+  strategy: "camera-side-central-ranked-v1";
+  cameraSideCheck: CameraSideCheck;
+  segmentStability: SegmentStabilityReport[];
+  cycles: CycleValidationReport[];
+  selectedCycleCount: number;
+  staticStanding: StaticStandingValidationReport;
 }
 
 export interface FilterCandidateValidation {
@@ -96,10 +148,13 @@ export interface FilterCandidateValidation {
   highFrequencyResidual: number;
   peakAttenuation: number;
   romAttenuation: number;
+  peakTimingShiftMs: number;
+  rawFrameToFrameVariation: number;
+  filteredFrameToFrameVariation: number;
 }
 
 export interface AnalysisVersions {
-  analysisVersion: "motionlab-gait-web/0.3.0";
+  analysisVersion: "motionlab-gait-web/0.4.0";
   poseModelVersion: "@mediapipe/tasks-vision@1.0.1/pose_landmarker_full";
   filterVersion: "butterworth4-zero-phase-v1";
   angleDefinitionVersion: "sagittal-pixel-v2";
@@ -107,7 +162,7 @@ export interface AnalysisVersions {
 }
 
 export interface GaitAnalysisResult {
-  analysisVersion: "motionlab-gait-web/0.3.0";
+  analysisVersion: "motionlab-gait-web/0.4.0";
   versions: AnalysisVersions;
   fps: number;
   videoMetadata?: VideoAnalysisMetadata;
@@ -121,7 +176,10 @@ export interface GaitAnalysisResult {
   cycles: GaitCycle[];
   angles: AnglePoint[];
   rawAngles: AnglePoint[];
+  continuousRawAngles: AnglePoint[];
+  continuousFilteredAngles: AnglePoint[];
   jointQuality: JointQualityReport[];
   filterValidation: FilterCandidateValidation[];
+  spatialValidation: SpatialValidationReport;
   warnings: string[];
 }

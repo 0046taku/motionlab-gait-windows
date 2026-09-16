@@ -1,7 +1,7 @@
 import type { PoseFrame, VideoAnalysisMetadata } from "../domain/models";
 import { effectivePresence } from "./landmarkProcessor";
 import { clamp, mean, standardDeviation } from "./statistics";
-import type { AcquisitionQuality, GaitCycle, Side, ViewpointReport } from "./types";
+import type { AcquisitionQuality, CameraSideCheck, GaitCycle, Side, ViewpointReport } from "./types";
 
 const FULL_BODY = [0, 11, 12, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32] as const;
 const LOWER_LIMB: Record<Side, readonly number[]> = {
@@ -16,7 +16,8 @@ export function assessAcquisitionQuality(
   metadata: VideoAnalysisMetadata | undefined,
   viewpoint: ViewpointReport,
   cycles: readonly GaitCycle[],
-  primarySide: Side | null
+  primarySide: Side | null,
+  cameraSideCheck: CameraSideCheck
 ): AcquisitionQuality {
   const fullBodyCoverage = coverage(frames, FULL_BODY);
   const lowerCoverage = {
@@ -34,6 +35,8 @@ export function assessAcquisitionQuality(
   const hardReasons: string[] = [];
   const cautionReasons: string[] = [];
 
+  if (!primarySide) hardReasons.push("カメラ側（右側面／左側面）を設定してください");
+  if (cameraSideCheck.agreement === "conflict") cautionReasons.push("カメラ側の設定を確認してください");
   if (!hasFrameGeometry(frames, metadata)) hardReasons.push("解析フレーム寸法がないため、Poseの再解析が必要です");
   if (!viewpoint.analysisSupported) hardReasons.push("安定した真横の歩行区間を確認できません");
   if (primaryLimbCoverage < 0.55) hardReasons.push(`${sideLabel(primarySide)}下肢の追跡が途中で失われています`);
@@ -41,7 +44,7 @@ export function assessAcquisitionQuality(
   if (footCoverage < 0.50) hardReasons.push(`${sideLabel(primarySide)}踵・足先の追跡が不十分です`);
   else if (footCoverage < 0.75) cautionReasons.push(`${sideLabel(primarySide)}踵・足先が一部不安定です`);
   if (cycles.length < 2) hardReasons.push("解析可能な歩行周期が2周期未満です");
-  else if (cycles.length < 4) cautionReasons.push("解析可能な歩行周期が少ないため再現性に注意が必要です");
+  else if (cycles.length < 3) cautionReasons.push("解析可能な歩行周期が少ないため再現性に注意が必要です");
   if (cameraStability < 0.45) hardReasons.push("カメラ移動または画角変化の可能性があります");
   else if (cameraStability < 0.72) cautionReasons.push("カメラの固定状態を確認してください");
   if (metadata) {
@@ -63,7 +66,8 @@ export function assessAcquisitionQuality(
   const reasons = [...hardReasons, ...cautionReasons].filter((value, index, values) => values.indexOf(value) === index).slice(0, 3);
   return {
     status, reasons, fullBodyCoverage, footCoverage, primaryLimbCoverage,
-    cameraStability, sideViewScore: viewpoint.stableSagittalScore, cycleCount: cycles.length
+    cameraStability, sideViewScore: viewpoint.stableSagittalScore, cycleCount: cycles.length,
+    cameraSideAgreement: cameraSideCheck.agreement
   };
 }
 

@@ -2,13 +2,14 @@ import type { PoseFrame, PoseLandmark, VideoAnalysisMetadata } from "../domain/m
 import { assessAcquisitionQuality } from "./acquisitionQuality";
 import { effectivePresence, processLandmarks } from "./landmarkProcessor";
 import { clamp, mean, median, round, standardDeviation } from "./statistics";
+import { cyclesSelectedByValidation, validateSpatialBiomechanics } from "./spatialValidation";
 import type {
   AnalysisVersions, AnglePoint, FilterCandidateValidation, GaitAnalysisResult, GaitCycle, GaitEvent, Joint,
   JointQualityReport, ProcessedPoseFrame, Side, ViewpointReport
 } from "./types";
 
 const VERSIONS: AnalysisVersions = {
-  analysisVersion: "motionlab-gait-web/0.3.0",
+  analysisVersion: "motionlab-gait-web/0.4.0",
   poseModelVersion: "@mediapipe/tasks-vision@1.0.1/pose_landmarker_full",
   filterVersion: "butterworth4-zero-phase-v1",
   angleDefinitionVersion: "sagittal-pixel-v2",
@@ -18,6 +19,7 @@ const VERSIONS: AnalysisVersions = {
 export interface GaitAnalysisOptions {
   videoMetadata?: VideoAnalysisMetadata;
   cameraSide?: "left" | "right" | "unspecified";
+  orthosis?: "none" | "used" | "unspecified";
   validationMode?: boolean;
 }
 
@@ -40,14 +42,16 @@ export function analyzeGait(frames: readonly PoseFrame[], options: GaitAnalysisO
   const viewpoint = assessViewpoint(processing.frames, processing.fps);
   const warnings = [...viewpoint.warnings];
   if (!viewpoint.analysisSupported) {
+    const spatialValidation = validateSpatialBiomechanics(geometryFrames, [], [], primarySide);
     const acquisitionQuality = assessAcquisitionQuality(
-      geometryFrames, options.videoMetadata, viewpoint, [], primarySide
+      geometryFrames, options.videoMetadata, viewpoint, [], primarySide, spatialValidation.cameraSideCheck
     );
     return {
-      analysisVersion: "motionlab-gait-web/0.3.0", versions: VERSIONS,
+      analysisVersion: "motionlab-gait-web/0.4.0", versions: VERSIONS,
       fps: processing.fps, videoMetadata: options.videoMetadata, primarySide, acquisitionQuality,
       direction: "unknown", directionConfidence: 0, viewpoint,
       processing: processing.report, events: [], cycles: [], angles: [], rawAngles: [],
+      continuousRawAngles: [], continuousFilteredAngles: [], spatialValidation,
       jointQuality: JOINTS.map((joint) => emptyQuality(joint)), filterValidation: [], warnings
     };
   }
@@ -55,20 +59,36 @@ export function analyzeGait(frames: readonly PoseFrame[], options: GaitAnalysisO
   const rawFrames = selectAnalysisFrames(geometryFrames, viewpoint);
   const detected = detectEvents(filteredFrames, processing.fps);
   warnings.push(...detected.warnings);
-  const filteredAngles = calculateJointAngles(filteredFrames, detected.cycles, detected.direction);
-  const rawAngles = calculateJointAngles(rawFrames, detected.cycles, detected.direction);
+  const continuousFilteredAngles = calculateJointAngles(filteredFrames, detected.cycles, detected.direction);
+  const continuousRawAngles = calculateJointAngles(rawFrames, detected.cycles, detected.direction);
+  const spatialValidation = validateSpatialBiomechanics(
+    rawFrames, detected.cycles, continuousRawAngles, primarySide
+  );
+  const selectedCycles = cyclesSelectedByValidation(detected.cycles, spatialValidation);
+  const filteredAngles = calculateJointAngles(filteredFrames, selectedCycles, detected.direction);
+  const rawAngles = calculateJointAngles(rawFrames, selectedCycles, detected.direction);
   const assessments = JOINTS.map((joint) => assessJoint(
-    joint, rawFrames, filteredFrames, filteredAngles, detected.cycles, detected.direction, primarySide
+    joint, rawFrames, filteredFrames, filteredAngles, selectedCycles, detected.direction, primarySide
   ));
+  if (options.orthosis === "used") {
+    const ankle = assessments.find((item) => item.report.joint === "ankle_dorsiflexion");
+    ankle?.report.warnings.push("足関節角度は装具・靴の影響を受ける可能性があります。");
+  }
   const validCycles = new Map(assessments.map((item) => [item.report.joint, item.validCycleKeys]));
   const acquisitionQuality = assessAcquisitionQuality(
-    rawFrames, options.videoMetadata, viewpoint, detected.cycles, primarySide
+    rawFrames, options.videoMetadata, viewpoint, selectedCycles, primarySide, spatialValidation.cameraSideCheck
   );
   const filterValidation = options.validationMode
-    ? validateFilterCandidates(geometryFrames, viewpoint, detected.cycles, detected.direction, filteredAngles)
+    ? validateFilterCandidates(geometryFrames, viewpoint, selectedCycles, detected.direction, filteredAngles)
     : [];
+  const clinicalAngles = primarySide
+    ? excludeInvalidCyclePoints(filteredAngles, selectedCycles, validCycles)
+      .filter((point) => point.side === primarySide && point.cyclePercent !== null) : [];
+  const clinicalRawAngles = primarySide
+    ? excludeInvalidCyclePoints(rawAngles, selectedCycles, validCycles)
+      .filter((point) => point.side === primarySide && point.cyclePercent !== null) : [];
   return {
-    analysisVersion: "motionlab-gait-web/0.3.0", versions: VERSIONS,
+    analysisVersion: "motionlab-gait-web/0.4.0", versions: VERSIONS,
     fps: processing.fps,
     videoMetadata: options.videoMetadata,
     primarySide,
@@ -77,12 +97,15 @@ export function analyzeGait(frames: readonly PoseFrame[], options: GaitAnalysisO
     directionConfidence: detected.directionConfidence,
     viewpoint,
     processing: processing.report,
-    events: detected.events,
-    cycles: detected.cycles,
-    angles: excludeInvalidCyclePoints(filteredAngles, detected.cycles, validCycles),
-    rawAngles: excludeInvalidCyclePoints(rawAngles, detected.cycles, validCycles),
+    events: primarySide ? detected.events.filter((event) => event.side === primarySide) : [],
+    cycles: selectedCycles,
+    angles: clinicalAngles,
+    rawAngles: clinicalRawAngles,
+    continuousRawAngles,
+    continuousFilteredAngles,
     jointQuality: assessments.map((item) => item.report),
     filterValidation,
+    spatialValidation,
     warnings
   };
 }
@@ -609,18 +632,38 @@ function validateFilterCandidates(
         const rawValues = pairs.map((pair) => pair[0]); const filteredValues = pairs.map((pair) => pair[1]);
         const rawRom = Math.max(...rawValues) - Math.min(...rawValues);
         const filteredRom = Math.max(...filteredValues) - Math.min(...filteredValues);
+        const peakTimingShifts = cycles.filter((cycle) => cycle.side === side).flatMap((cycle) => {
+          const rawCycle = raw.filter((point) => point.timestampMs >= cycle.startMs && point.timestampMs <= cycle.endMs);
+          const filteredCycle = candidate.filter((point) => point.timestampMs >= cycle.startMs && point.timestampMs <= cycle.endMs);
+          if (!rawCycle.length || !filteredCycle.length) return [];
+          const rawPeak = rawCycle.reduce((best, point) => point.angleDegrees > best.angleDegrees ? point : best);
+          const filteredPeak = filteredCycle.reduce((best, point) => point.angleDegrees > best.angleDegrees ? point : best);
+          return [Math.abs(rawPeak.timestampMs - filteredPeak.timestampMs)];
+        });
         output.push({
           cutoffHz: cutoff,
           joint,
           side,
           highFrequencyResidual: round(Math.sqrt(mean(pairs.map(([rawValue, filteredValue]) => (rawValue - filteredValue) ** 2))), 4),
           peakAttenuation: round(Math.max(...rawValues) - Math.max(...filteredValues), 4),
-          romAttenuation: round(rawRom - filteredRom, 4)
+          romAttenuation: round(rawRom - filteredRom, 4),
+          peakTimingShiftMs: peakTimingShifts.length ? round(median(peakTimingShifts), 1) : 0,
+          rawFrameToFrameVariation: round(frameToFrameVariation(raw), 4),
+          filteredFrameToFrameVariation: round(frameToFrameVariation(candidate), 4)
         });
       }
     }
   }
   return output;
+}
+
+function frameToFrameVariation(points: readonly AnglePoint[]): number {
+  const ordered = [...points].sort((a, b) => a.timestampMs - b.timestampMs);
+  const differences = ordered.slice(1).flatMap((point, index) => {
+    const before = ordered[index]!;
+    return point.timestampMs - before.timestampMs <= 100 ? [Math.abs(point.angleDegrees - before.angleDegrees)] : [];
+  });
+  return differences.length ? median(differences) : 0;
 }
 
 export function representativeWaveform(

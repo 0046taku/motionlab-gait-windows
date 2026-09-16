@@ -7,6 +7,7 @@ import { MotionLabDatabase } from "../storage/database";
 import { VideoPoseAnalyzer } from "../video/VideoPoseAnalyzer";
 import { AnalysisResultsView } from "./AnalysisResultsView";
 import { CaptureGuide } from "./CaptureGuide";
+import { ValidationPanel } from "./ValidationPanel";
 
 export class App {
   private readonly database = new MotionLabDatabase();
@@ -21,6 +22,8 @@ export class App {
   private viewerTab: "video" | "analysis" = "video";
   private readonly gaitAnalysisCache = new Map<string, GaitAnalysisResult>();
   private captureGuide: CaptureGuide | null = null;
+  private validationPanel: ValidationPanel | null = null;
+  private readonly validationMode = new URLSearchParams(window.location.search).get("validation") === "1";
 
   constructor(private readonly root: HTMLElement) {}
 
@@ -295,6 +298,7 @@ export class App {
           <button id="cancel-analysis" class="button ghost small" type="button">解析を中止</button>
         </div>
         <div id="result-summary"></div>
+        ${study.status === "ready" && this.validationMode ? `<div id="validation-panel-host"></div>` : ""}
       </div>
       ${study.status === "ready" ? `<div id="analysis-view-panel" class="viewer-panel" role="tabpanel" ${this.viewerTab === "video" ? "hidden" : ""}></div>` : ""}`;
     const player = this.requireElement<HTMLVideoElement>("player");
@@ -302,6 +306,14 @@ export class App {
     player.src = this.objectUrl;
     if (study.status === "ready") this.attachOverlay(player, study);
     this.renderResultSummary(study);
+    if (study.status === "ready" && this.validationMode) {
+      const host = this.requireElement("validation-panel-host");
+      this.validationPanel = new ValidationPanel(host, player, study, this.getGaitAnalysis(study), async (references) => {
+        study.manualAngleReferences = references;
+        await this.database.saveVideo(study);
+      });
+      this.validationPanel.render();
+    }
     if (study.status === "ready") {
       this.requireElement("video-view-tab").addEventListener("click", () => this.selectViewerTab("video", study));
       this.requireElement("analysis-view-tab").addEventListener("click", () => this.selectViewerTab("analysis", study));
@@ -335,7 +347,9 @@ export class App {
     if (!result) {
       result = analyzeGait(study.poseFrames, {
         videoMetadata: study.videoMetadata,
-        cameraSide: study.captureConditions?.cameraSide
+        cameraSide: study.captureConditions?.cameraSide,
+        orthosis: study.captureConditions?.orthosis,
+        validationMode: this.validationMode
       });
       this.gaitAnalysisCache.set(study.id, result);
     }
@@ -391,7 +405,7 @@ export class App {
       id: crypto.randomUUID(), patientId: this.selectedPatientId, originalName: file.name,
       createdAt: new Date().toISOString(), durationMs: 0, status: "pending", error: "",
       video: file, poseFrames: [], schema: "motionlab.pose.v1",
-      analysisVersion: "motionlab-gait-web/0.3.0", captureConditions
+      analysisVersion: "motionlab-gait-web/0.4.0", captureConditions
     };
     try {
       await this.database.saveVideo(study);
@@ -417,12 +431,12 @@ export class App {
         this.requireElement("progress-message").textContent = message;
         this.requireElement("progress-percent").textContent = `${Math.round(ratio * 100)}%`;
         this.requireElement<HTMLProgressElement>("progress-bar").value = ratio;
-      });
+      }, { cameraSide: study.captureConditions?.cameraSide });
       study.status = "ready";
       study.durationMs = result.durationMs;
       study.poseFrames = result.frames;
       study.videoMetadata = result.metadata;
-      study.analysisVersion = "motionlab-gait-web/0.3.0";
+      study.analysisVersion = "motionlab-gait-web/0.4.0";
       study.error = "";
       this.gaitAnalysisCache.delete(study.id);
     } catch (error) {
@@ -480,6 +494,8 @@ export class App {
   }
 
   private releaseOverlay(): void {
+    this.validationPanel?.dispose();
+    this.validationPanel = null;
     const player = document.getElementById("player") as HTMLVideoElement | null;
     if (player && this.videoFrameHandle !== null && typeof player.cancelVideoFrameCallback === "function") {
       player.cancelVideoFrameCallback(this.videoFrameHandle);

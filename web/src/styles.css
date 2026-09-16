@@ -202,6 +202,33 @@ progress { width: 100%; height: 12px; margin-top: 10px; accent-color: var(--bran
 .analysis-empty strong { display: block; color: var(--ink); }
 .analysis-empty p { margin: 7px auto 0; max-width: 620px; color: var(--muted); line-height: 1.6; }
 
+.validation-panel { margin-top: 14px; border: 1px solid #9eb9b3; border-radius: 13px; background: #f8fbfa; }
+.validation-panel > summary { cursor: pointer; padding: 12px 14px; color: var(--brand-strong); font-size: 13px; font-weight: 900; }
+.validation-body { padding: 0 14px 16px; }
+.validation-warning, .validation-note { padding: 9px 11px; border-left: 4px solid #c58b12; border-radius: 7px; color: #604b1b; background: #fff8df; font-size: 12px; line-height: 1.55; }
+.validation-model { display: grid; gap: 3px; padding: 11px; border-radius: 9px; background: #edf4f2; font-size: 12px; }
+.validation-model small { color: var(--muted); }
+.validation-grid, .validation-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }
+.validation-grid section, .validation-metric-card { min-width: 0; padding: 11px; border: 1px solid var(--line); border-radius: 10px; background: white; }
+.validation-grid h4, .validation-metric-card h4, .validation-frame-review h4 { margin: 0 0 7px; font-size: 13px; }
+.validation-grid p, .validation-grid small { display: block; margin: 4px 0; color: var(--muted); font-size: 11px; line-height: 1.45; }
+.validation-frame-review { margin-top: 10px; padding: 11px; border: 1px solid var(--line); border-radius: 10px; background: white; }
+.validation-frame-review p { margin: 3px 0 8px; color: var(--muted); font-size: 12px; }
+#validation-zoom-canvas { display: block; width: 100%; height: auto; max-height: 320px; border-radius: 9px; background: #0c1715; object-fit: contain; }
+.validation-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 9px; }
+.validation-metric-card dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; margin: 0; }
+.validation-metric-card dl div { min-width: 0; padding: 6px; border-radius: 7px; background: #f3f8f6; }
+.validation-metric-card dt { color: var(--muted); font-size: 10px; }
+.validation-metric-card dd { margin: 2px 0 0; font-size: 12px; font-weight: 800; overflow-wrap: anywhere; }
+.validation-table-wrap { width: 100%; max-width: 100%; overflow-x: auto; margin-top: 10px; }
+.validation-table { width: 100%; min-width: 650px; border-collapse: collapse; font-size: 11px; }
+.validation-table th, .validation-table td { padding: 7px; border-bottom: 1px solid var(--line); text-align: left; }
+.validation-table th { color: var(--muted); background: #edf4f2; }
+.validation-table input { width: 88px; padding: 6px; border: 1px solid #b8cec9; border-radius: 7px; }
+.validation-seek, .validation-remove { border: 0; color: var(--brand); background: transparent; font: inherit; text-align: left; }
+.validation-remove { color: var(--danger); font-size: 16px; }
+.validation-empty { padding: 16px; border: 1px dashed #b8cec9; border-radius: 9px; color: var(--muted); text-align: center; font-size: 12px; }
+
 dialog { border: 0; border-radius: 18px; width: min(calc(100% - 24px), 480px); max-width: calc(100% - 24px); padding: 0; box-shadow: 0 24px 80px rgba(0,0,0,.25); }
 dialog::backdrop { background: rgba(7, 34, 31, .54); backdrop-filter: blur(3px); }
 .dialog-body { padding: 24px; }
@@ -311,6 +338,7 @@ dialog::backdrop { background: rgba(7, 34, 31, .54); backdrop-filter: blur(3px);
   .joint-button { padding-inline: 7px; }
   .chart-card { padding: 2px; }
   .analysis-metrics { grid-template-columns: 1fr; }
+  .validation-grid, .validation-metrics { grid-template-columns: 1fr; }
   .capture-quality { grid-template-columns: 1fr; }
   .guide-steps li { grid-template-columns: 34px minmax(0, 1fr); }
   .guide-steps span { grid-column: 2; }

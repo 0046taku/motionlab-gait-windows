@@ -1,5 +1,6 @@
 import type { PoseFrame, VideoAnalysisMetadata } from "../domain/models";
 import { MediaPipePoseProvider } from "../pose/MediaPipePoseProvider";
+import type { PoseProviderFactory } from "../pose/PoseProvider";
 
 export interface AnalysisProgress {
   completed: number;
@@ -7,8 +8,15 @@ export interface AnalysisProgress {
   message: string;
 }
 
+export interface VideoPoseAnalysisOptions {
+  fallbackSampleFps?: number;
+  cameraSide?: "left" | "right" | "unspecified";
+}
+
 export class VideoPoseAnalyzer {
   private cancelled = false;
+
+  constructor(private readonly poseProviderFactory: PoseProviderFactory = () => new MediaPipePoseProvider()) {}
 
   cancel(): void {
     this.cancelled = true;
@@ -17,7 +25,7 @@ export class VideoPoseAnalyzer {
   async analyze(
     blob: Blob,
     onProgress: (progress: AnalysisProgress) => void,
-    fallbackSampleFps = 30
+    options: VideoPoseAnalysisOptions = {}
   ): Promise<{ frames: PoseFrame[]; durationMs: number; metadata: VideoAnalysisMetadata }> {
     this.cancelled = false;
     const video = document.createElement("video");
@@ -28,7 +36,7 @@ export class VideoPoseAnalyzer {
     document.body.append(video);
     const objectUrl = URL.createObjectURL(blob);
     video.src = objectUrl;
-    const provider = new MediaPipePoseProvider();
+    const provider = this.poseProviderFactory();
     try {
       await waitForMetadata(video);
       if (!Number.isFinite(video.duration) || video.duration <= 0) {
@@ -51,7 +59,7 @@ export class VideoPoseAnalyzer {
       if (this.cancelled) throw new Error("解析を中止しました。");
       const timestamps = presentationTimestamps && presentationTimestamps.length >= 10
         ? presentationTimestamps
-        : fixedTimestamps(video.duration, fallbackSampleFps);
+        : fixedTimestamps(video.duration, options.fallbackSampleFps ?? 30);
       const timestampSource: VideoAnalysisMetadata["timestampSource"] = presentationTimestamps && presentationTimestamps.length >= 10
         ? "presentation_timestamps" : "fixed_30fps_fallback";
       const total = timestamps.length;
@@ -64,6 +72,7 @@ export class VideoPoseAnalyzer {
 
       const frames: PoseFrame[] = [];
       const brightnessValues: number[] = [];
+      const sharpnessScores: { timestampMs: number; sharpness: number }[] = [];
       for (let frameIndex = 0; frameIndex < timestamps.length; frameIndex += 1) {
         if (this.cancelled) throw new Error("解析を中止しました。");
         const seconds = Math.min(video.duration - 0.001, timestamps[frameIndex]!);
@@ -76,6 +85,8 @@ export class VideoPoseAnalyzer {
         const timestampMs = Math.round(seconds * 1000);
         const frame = await provider.detect(imageData, frameIndex, timestampMs);
         frames.push(frame);
+        const sharpness = estimateDistalSharpness(context, canvas.width, canvas.height, frame, options.cameraSide);
+        if (sharpness !== null) sharpnessScores.push({ timestampMs, sharpness });
         onProgress({
           completed: frameIndex + 1,
           total,
@@ -85,7 +96,10 @@ export class VideoPoseAnalyzer {
       }
       const intervals = timestamps.slice(1).map((value, index) => value - timestamps[index]!)
         .filter((value) => value > 0 && value <= 1);
-      const estimatedFps = intervals.length ? 1 / median(intervals) : fallbackSampleFps;
+      const estimatedFps = intervals.length ? 1 / median(intervals) : options.fallbackSampleFps ?? 30;
+      const medianSharpness = median(sharpnessScores.map((item) => item.sharpness));
+      const lowSharpnessFlags = sharpnessScores.map((item) => item.sharpness < medianSharpness * 0.55);
+      const longestConsecutiveLowFrames = longestTrueRun(lowSharpnessFlags);
       return {
         frames,
         durationMs: Math.round(video.duration * 1000),
@@ -99,7 +113,16 @@ export class VideoPoseAnalyzer {
           averageBrightness: average(brightnessValues),
           lowBrightnessRate: brightnessValues.length
             ? brightnessValues.filter((value) => value < 45).length / brightnessValues.length : 1,
-          analyzedFrameCount: frames.length
+          analyzedFrameCount: frames.length,
+          motionBlurValidation: sharpnessScores.length ? {
+            method: "camera-side-distal-gradient-v1",
+            cameraSide: options.cameraSide ?? "unspecified",
+            scores: sharpnessScores,
+            medianSharpness,
+            lowSharpnessRate: lowSharpnessFlags.filter(Boolean).length / sharpnessScores.length,
+            longestConsecutiveLowFrames,
+            reviewRecommended: longestConsecutiveLowFrames >= Math.max(3, Math.round(estimatedFps * 0.15))
+          } : undefined
         }
       };
     } finally {
@@ -110,6 +133,45 @@ export class VideoPoseAnalyzer {
       await provider.close().catch(() => undefined);
     }
   }
+}
+
+function estimateDistalSharpness(
+  context: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  frame: PoseFrame,
+  side: "left" | "right" | "unspecified" | undefined
+): number | null {
+  if (side !== "left" && side !== "right") return null;
+  const indices = side === "left" ? [25, 27, 29, 31] : [26, 28, 30, 32];
+  const landmarks = frame.landmarks.filter((item) => indices.includes(item.index) && item.visibility >= 0.5);
+  if (landmarks.length < 3) return null;
+  const radius = Math.max(4, Math.round(Math.min(width, height) * 0.025));
+  const scores: number[] = [];
+  for (const landmark of landmarks) {
+    const left = Math.max(0, Math.round(landmark.x * width) - radius);
+    const top = Math.max(0, Math.round(landmark.y * height) - radius);
+    const patchWidth = Math.min(width - left, radius * 2 + 1);
+    const patchHeight = Math.min(height - top, radius * 2 + 1);
+    if (patchWidth < 5 || patchHeight < 5) continue;
+    const patch = context.getImageData(left, top, patchWidth, patchHeight);
+    scores.push(meanGradientMagnitude(patch));
+  }
+  return scores.length ? average(scores) : null;
+}
+
+function meanGradientMagnitude(image: ImageData): number {
+  const gray = (index: number) => 0.2126 * image.data[index]! + 0.7152 * image.data[index + 1]! + 0.0722 * image.data[index + 2]!;
+  let total = 0; let count = 0;
+  for (let y = 1; y < image.height - 1; y += 1) {
+    for (let x = 1; x < image.width - 1; x += 1) {
+      const center = 4 * (y * image.width + x);
+      const gx = gray(center + 4) - gray(center - 4);
+      const gy = gray(center + 4 * image.width) - gray(center - 4 * image.width);
+      total += Math.hypot(gx, gy); count += 1;
+    }
+  }
+  return count ? total / count : 0;
 }
 
 function fixedTimestamps(duration: number, fps: number): number[] {
@@ -178,6 +240,15 @@ function median(values: readonly number[]): number {
   const sorted = [...values].sort((a, b) => a - b);
   const middle = Math.floor(sorted.length / 2);
   return sorted.length % 2 ? sorted[middle]! : (sorted[middle - 1]! + sorted[middle]!) / 2;
+}
+
+function longestTrueRun(values: readonly boolean[]): number {
+  let longest = 0; let current = 0;
+  for (const value of values) {
+    current = value ? current + 1 : 0;
+    longest = Math.max(longest, current);
+  }
+  return longest;
 }
 
 function waitForMetadata(video: HTMLVideoElement): Promise<void> {

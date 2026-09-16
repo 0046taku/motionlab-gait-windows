@@ -60,6 +60,34 @@ export interface VideoAnalysisMetadata {
   averageBrightness: number;
   lowBrightnessRate: number;
   analyzedFrameCount: number;
+  motionBlurValidation?: MotionBlurValidation;
+}
+
+export interface MotionBlurValidation {
+  method: "camera-side-distal-gradient-v1";
+  cameraSide: "left" | "right" | "unspecified";
+  scores: { timestampMs: number; sharpness: number }[];
+  medianSharpness: number;
+  /** Relative distribution only. No clinical pass/fail threshold is applied. */
+  lowSharpnessRate: number;
+  longestConsecutiveLowFrames: number;
+  /** Validation-mode advisory only; not a validated clinical QC decision. */
+  reviewRecommended: boolean;
+}
+
+export type GaitPhaseLabel = "IC" | "loading_response" | "mid_stance" | "terminal_stance"
+  | "pre_swing" | "initial_swing" | "mid_swing" | "terminal_swing" | "other";
+
+export interface ManualAngleReference {
+  id: string;
+  timestampMs: number;
+  phase: GaitPhaseLabel;
+  joint: "knee_flexion";
+  side: "left" | "right";
+  manualAngleDegrees: number | null;
+  rawAngleDegrees: number | null;
+  filteredAngleDegrees: number | null;
+  analysisVersion: string;
 }
 
 export type VideoStatus = "pending" | "analyzing" | "ready" | "failed";
@@ -75,9 +103,10 @@ export interface VideoStudy {
   video: Blob;
   poseFrames: PoseFrame[];
   schema: "motionlab.pose.v1";
-  analysisVersion: "motionlab-gait-web/0.1.0" | "motionlab-gait-web/0.2.0" | "motionlab-gait-web/0.3.0";
+  analysisVersion: "motionlab-gait-web/0.1.0" | "motionlab-gait-web/0.2.0" | "motionlab-gait-web/0.3.0" | "motionlab-gait-web/0.4.0";
   captureConditions?: CaptureConditions;
   videoMetadata?: VideoAnalysisMetadata;
+  manualAngleReferences?: ManualAngleReference[];
 }
 
 export interface StorageEstimate {

@@ -65,8 +65,14 @@ export class AnalysisResultsView {
         <div class="analysis-empty"><strong>歩行イベントを確認してください</strong><p>${quality?.warnings.join(" ") || "この関節の有効な歩行周期を取得できませんでした。"}</p></div>`;
       return;
     }
-    const left = representativeWaveform(this.result.angles, this.joint, "left", "median");
-    const right = representativeWaveform(this.result.angles, this.joint, "right", "median");
+    const primarySide = this.result.primarySide;
+    if (!primarySide) {
+      content.innerHTML = `<div class="analysis-empty"><strong>カメラ側を確認してください</strong><p>右側面または左側面を選択して再解析してください。</p></div>`;
+      return;
+    }
+    const primary = representativeWaveform(this.result.angles, this.joint, primarySide, "median");
+    const left = primarySide === "left" ? primary : [];
+    const right = primarySide === "right" ? primary : [];
     const references = this.showReference ? normalReference(this.joint) : [];
     const allValues = [...left.map((point) => point.value), ...right.map((point) => point.value), ...references.map((point) => point.mean)];
     if (!allValues.length) {
@@ -75,24 +81,22 @@ export class AnalysisResultsView {
       return;
     }
     const axis = niceAxis(allValues);
-    const chart = renderChart(
-      left, right, references, axis.minimum, axis.maximum, axis.step, this.joint, this.result.primarySide
-    );
+    const chart = renderChart(left, right, references, axis.minimum, axis.maximum, axis.step, this.joint, primarySide);
     const ankleSuffix = this.joint === "ankle_dorsiflexion" && quality.status === "caution" ? "（参考値）" : "";
     content.innerHTML = `
       <div class="quality-row">
         <span class="quality-badge ${statusClass}">測定品質：${statusLabel}${ankleSuffix}</span>
-        ${this.result.primarySide ? `<span class="primary-side">Primary：${this.result.primarySide === "left" ? "左" : "右"}（カメラ側）</span>` : ""}
+        <span class="primary-side">正式解析：${primarySide === "left" ? "左" : "右"}（カメラ側）</span>
         <label class="reference-toggle"><input id="reference-toggle" type="checkbox" ${this.showReference ? "checked" : ""} />参考波形</label>
       </div>
       ${quality.warnings.length ? `<p class="joint-warning">${quality.warnings.join(" ")}</p>` : ""}
       <div class="chart-card">${chart}</div>
       ${this.showReference ? `<p class="reference-note">${REFERENCE_LABEL}</p>` : ""}
       <div class="analysis-metrics" aria-label="関節角度の要約">
-        ${summaryMetric("左", left)}${summaryMetric("右", right)}
+        ${summaryMetric(`${primarySide === "left" ? "左" : "右"}（カメラ側）`, primary)}
         <div class="analysis-metric"><span>有効周期</span><strong>${quality.validCycleCount}</strong><small>除外 ${quality.excludedCycleCount}周期</small></div>
       </div>
-      <p class="analysis-disclaimer">2D Poseによる臨床観察支援値です。診断や治療判断には、動画上の姿勢と併せて確認してください。</p>`;
+      <p class="analysis-disclaimer">2D Poseによるcamera-side臨床観察支援値です。左右比較には、右側面動画と左側面動画の2本を撮影してください。</p>`;
     content.querySelector<HTMLInputElement>("#reference-toggle")?.addEventListener("change", (event) => {
       this.showReference = (event.currentTarget as HTMLInputElement).checked;
       this.renderJoint();
@@ -118,7 +122,7 @@ function niceAxis(values: readonly number[]): { minimum: number; maximum: number
 function renderChart(
   left: readonly SeriesPoint[], right: readonly SeriesPoint[],
   reference: readonly { percent: number; mean: number }[], minimum: number, maximum: number, step: number,
-  joint: Joint, primarySide: Side | null
+  joint: Joint, primarySide: Side
 ): string {
   const width = 720; const height = 360; const margin = { left: 64, right: 24, top: 52, bottom: 58 };
   const plotWidth = width - margin.left - margin.right; const plotHeight = height - margin.top - margin.bottom;
@@ -128,14 +132,16 @@ function renderChart(
   const yTicks: number[] = [];
   for (let value = minimum; value <= maximum + step * 0.1; value += step) yTicks.push(value);
   const referencePoints = reference.map((point) => ({ percent: point.percent, value: point.mean }));
-  return `<svg class="joint-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="${JOINT_LABELS[joint]}の左・右波形">
+  const primaryLabel = primarySide === "left" ? "左（カメラ側）" : "右（カメラ側）";
+  const primaryColor = SIDE_COLORS[primarySide];
+  return `<svg class="joint-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="${JOINT_LABELS[joint]}の${primaryLabel}波形">
     <text class="chart-title" x="${width / 2}" y="25" text-anchor="middle">${JOINT_LABELS[joint]}</text>
     ${yTicks.map((value) => `<line class="chart-grid" x1="${x(0)}" x2="${x(100)}" y1="${y(value)}" y2="${y(value)}"/><text class="chart-tick" x="${margin.left - 10}" y="${y(value) + 4}" text-anchor="end">${value.toFixed(0)}</text>`).join("")}
     ${[0, 25, 50, 75, 100].map((value) => `<line class="chart-grid vertical" x1="${x(value)}" x2="${x(value)}" y1="${margin.top}" y2="${height - margin.bottom}"/><text class="chart-tick" x="${x(value)}" y="${height - margin.bottom + 22}" text-anchor="middle">${value}</text>`).join("")}
     ${reference.length ? `<path class="chart-reference" d="${path(referencePoints)}"/>` : ""}
     ${left.length ? `<path class="chart-wave left${primarySide === "left" ? " primary" : primarySide === "right" ? " secondary-limb" : ""}" d="${path(left)}"/>` : ""}
     ${right.length ? `<path class="chart-wave right${primarySide === "right" ? " primary" : primarySide === "left" ? " secondary-limb" : ""}" d="${path(right)}"/>` : ""}
-    <g class="chart-legend"><line x1="${width - 178}" x2="${width - 154}" y1="25" y2="25" stroke="${SIDE_COLORS.left}" stroke-width="3"/><text x="${width - 148}" y="29">左${primarySide === "left" ? "*" : ""}</text><line x1="${width - 98}" x2="${width - 74}" y1="25" y2="25" stroke="${SIDE_COLORS.right}" stroke-width="3"/><text x="${width - 68}" y="29">右${primarySide === "right" ? "*" : ""}</text></g>
+    <g class="chart-legend"><line x1="${width - 170}" x2="${width - 146}" y1="25" y2="25" stroke="${primaryColor}" stroke-width="3"/><text x="${width - 140}" y="29">${primaryLabel}</text></g>
     <text class="chart-axis-label" x="${width / 2}" y="${height - 10}" text-anchor="middle">歩行周期（%）</text>
     <text class="chart-axis-label" transform="translate(17 ${height / 2}) rotate(-90)" text-anchor="middle">角度（°）</text>
   </svg>`;

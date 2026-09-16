@@ -1,5 +1,6 @@
 import type { PoseFrame } from "../domain/models";
 import type { PoseWorkerRequest, PoseWorkerResponse } from "./messages";
+import type { PoseProvider } from "./PoseProvider";
 
 interface PendingRequest {
   resolve: (response: PoseWorkerResponse) => void;
@@ -18,7 +19,7 @@ type PoseWorkerRequestInput =
     }
   | { type: "close" };
 
-export class MediaPipePoseProvider {
+export class MediaPipePoseProvider implements PoseProvider {
   private readonly worker: Worker;
   private readonly assetBase: string;
   private readonly pending = new Map<number, PendingRequest>();
